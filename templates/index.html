@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhishGuard • Phishing Domain Scanner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', system-ui, sans-serif; }
+        .hero-bg { background: linear-gradient(135deg, #0f172a 0%, #1e2937 100%); }
+        .result-row { transition: all 0.2s ease; }
+        .result-row:hover { background-color: rgba(239, 68, 68, 0.08); }
+        .live-dot { animation: livepulse 1.5s infinite; }
+        @keyframes livepulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+        .btn-ctrl { transition: all 0.18s ease; }
+        .btn-ctrl:hover { transform: translateY(-1px); }
+        .btn-ctrl:active { transform: translateY(0); }
+        /* Shimmer on progress bar */
+        @keyframes shimmer {
+            0%   { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+        .progress-shimmer {
+            background: linear-gradient(90deg, #ef4444 0%, #f97316 40%, #fbbf24 60%, #f97316 80%, #ef4444 100%);
+            background-size: 200% 100%;
+            animation: shimmer 2s linear infinite;
+        }
+        .progress-paused {
+            background: linear-gradient(90deg, #6b7280, #9ca3af);
+        }
+        /* Button pulse when scanning */
+        @keyframes scan-pulse { 0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0.4)} 50%{box-shadow:0 0 0 8px rgba(239,68,68,0)} }
+        .scanning-pulse { animation: scan-pulse 2s infinite; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+<div class="max-w-7xl mx-auto px-8 py-12">
+
+    <!-- Top Nav -->
+    <div class="flex justify-between items-center mb-12">
+        <div class="flex items-center gap-3">
+            <div class="w-11 h-11 bg-red-600 rounded-3xl flex items-center justify-center font-bold text-lg">PG</div>
+            <h1 class="text-4xl font-bold tracking-tighter">PhishGuard</h1>
+        </div>
+        <div class="flex items-center gap-8 text-lg">
+            <a href="/" class="font-medium text-white">Scanner</a>
+            <a href="/dashboard" class="text-gray-400 hover:text-white transition-colors">Dashboard</a>
+
+            {% if current_user.is_authenticated and current_user.is_admin %}
+            <a href="/admin/users" class="text-blue-400 hover:text-blue-300 transition-colors font-medium ml-4">
+                <i class="fas fa-users mb-0.5"></i> Users
+            </a>
+            {% endif %}
+            <div class="bg-emerald-500/10 text-emerald-400 px-5 py-2 rounded-3xl text-sm font-medium flex items-center gap-2">
+                <div class="w-2 h-2 bg-emerald-400 rounded-full live-dot"></div>
+                LIVE THREAT INTEL
+            </div>
+            {% if current_user.is_authenticated %}
+            <div class="flex items-center gap-3">
+                <span class="text-gray-400 font-mono text-sm pl-2"><i class="fas fa-user-circle text-gray-500 mr-1.5"></i>{{ current_user.username }}</span>
+                <a href="/logout" class="bg-gray-800 hover:bg-red-500/20 text-gray-300 hover:text-red-400 border border-gray-700 hover:border-red-500/40 px-5 py-2 rounded-3xl text-sm font-medium transition flex items-center gap-2">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </a>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Hero Card -->
+    <div class="hero-bg rounded-3xl p-12 shadow-2xl">
+
+        <!-- Headline -->
+        <div class="text-center mb-10">
+            <h2 class="text-6xl font-bold tracking-tighter mb-4">Find Lookalike Phishing Domains</h2>
+            <p class="text-xl text-gray-400">Enter any domain to scan for malicious variations — powered by real DNS intelligence</p>
+        </div>
+
+        <!-- Domain Input Row -->
+        <div id="input-area" class="max-w-3xl mx-auto bg-gray-900 rounded-3xl p-3 flex shadow-inner gap-2">
+            <input
+                id="domain-input"
+                type="text"
+                class="flex-1 bg-transparent px-8 py-6 text-2xl outline-none font-mono text-white placeholder-gray-500"
+                placeholder="e.g. paypal.com">
+            <button onclick="startScan()"
+                    id="scan-btn"
+                    class="bg-red-600 hover:bg-red-700 px-10 rounded-3xl font-semibold text-xl flex items-center gap-3 transition shrink-0">
+                <span id="btn-text">Scan Now</span>
+                <i id="btn-icon" class="fas fa-arrow-right"></i>
+            </button>
+        </div>
+
+        <!-- ── Control Buttons (shown during/after scan) ── -->
+        <div id="controls-row" class="hidden max-w-3xl mx-auto mt-4 flex items-center justify-center gap-3">
+
+            <!-- Pause -->
+            <button id="btn-pause" onclick="pauseScan()"
+                class="btn-ctrl hidden bg-amber-500/15 border border-amber-500/40 text-amber-300
+                       hover:bg-amber-500/25 px-7 py-3 rounded-2xl font-semibold text-sm
+                       flex items-center gap-2 scanning-pulse">
+                <i class="fas fa-pause"></i> Pause
+            </button>
+
+            <!-- Resume -->
+            <button id="btn-resume" onclick="resumeScan()"
+                class="btn-ctrl hidden bg-emerald-500/15 border border-emerald-500/40 text-emerald-300
+                       hover:bg-emerald-500/25 px-7 py-3 rounded-2xl font-semibold text-sm
+                       flex items-center gap-2">
+                <i class="fas fa-play"></i> Resume
+            </button>
+
+            <!-- Reset -->
+            <button id="btn-reset" onclick="resetScan()"
+                class="btn-ctrl hidden bg-gray-700/60 border border-gray-600 text-gray-300
+                       hover:bg-red-500/20 hover:border-red-500/40 hover:text-red-300
+                       px-7 py-3 rounded-2xl font-semibold text-sm flex items-center gap-2">
+                <i class="fas fa-trash-alt"></i> Reset
+            </button>
+
+            <!-- State label -->
+            <span id="state-badge" class="text-xs font-mono text-gray-500"></span>
+        </div>
+
+        <!-- Live Status / Progress -->
+        <div id="status-area" class="hidden mt-8 text-center">
+            <div class="inline-flex flex-col items-center bg-gray-900/90 backdrop-blur-md rounded-3xl px-10 py-6 shadow-2xl min-w-[400px]">
+                <div class="flex items-center gap-3 mb-4">
+                    <div id="status-dot" class="w-4 h-4 bg-red-500 rounded-full animate-ping"></div>
+                    <span id="status-text" class="font-mono text-lg">Resolving DNS...</span>
+                </div>
+                <div class="w-full h-2.5 bg-gray-800 rounded-full overflow-hidden">
+                    <div id="progress-bar" class="h-full progress-shimmer w-0 transition-all duration-700 rounded-full"></div>
+                </div>
+                <div class="mt-3 flex items-center gap-4 text-xs text-gray-400 font-mono">
+                    <span>Session: <span id="session-id-display" class="text-gray-200"></span></span>
+                    <span id="found-count" class="text-emerald-400"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Partial / Paused results banner -->
+        <div id="paused-banner" class="hidden mt-6 max-w-2xl mx-auto">
+            <div class="bg-amber-500/10 border border-amber-500/30 rounded-2xl px-6 py-4 flex items-center gap-4">
+                <i class="fas fa-pause-circle text-amber-400 text-2xl"></i>
+                <div>
+                    <div class="font-semibold text-amber-300">Scan Paused</div>
+                    <div class="text-sm text-gray-400 mt-0.5">
+                        Results so far are shown below. Click <strong class="text-emerald-400">Resume</strong> to continue from where it stopped, or <strong class="text-red-400">Reset</strong> to clear.
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Results Table -->
+        <div id="results-area" class="hidden mt-10">
+            <div class="flex justify-between items-center mb-5">
+                <h3 class="text-2xl font-semibold flex items-center gap-3">
+                    <i class="fas fa-shield-alt text-red-500"></i>
+                    Detected Domains
+                    <span id="results-count-badge" class="text-base font-mono bg-gray-800 px-3 py-1 rounded-2xl text-gray-400"></span>
+                </h3>
+                <button onclick="goToDashboard()" class="bg-white text-gray-900 px-7 py-2.5 rounded-3xl font-semibold text-sm flex items-center gap-2 hover:bg-gray-100 transition">
+                    Full Dashboard <i class="fas fa-arrow-right"></i>
+                </button>
+            </div>
+
+            <div class="bg-gray-900 rounded-3xl overflow-hidden shadow-2xl border border-gray-800">
+                <table class="w-full">
+                    <thead class="bg-gray-950 text-gray-400 border-b border-gray-800 text-xs uppercase tracking-wider">
+                        <tr>
+                            <th class="px-8 py-5 text-left">Domain</th>
+                            <th class="px-8 py-5 text-left">Risk</th>
+                            <th class="px-8 py-5 text-left">Score</th>
+                            <th class="px-8 py-5 text-left">Age (days)</th>
+                            <th class="px-8 py-5 text-left">Web Title</th>
+                            <th class="px-8 py-5 text-left">IP</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-body" class="divide-y divide-gray-800 text-sm font-mono"></tbody>
+                </table>
+            </div>
+        </div>
+
+    </div><!-- /hero -->
+</div>
+
+<!-- Toast -->
+<div id="toast" class="hidden fixed bottom-8 right-8 z-50 bg-gray-900 border border-red-500/60 text-white px-6 py-4 rounded-3xl shadow-2xl flex items-center gap-3">
+    <i id="toast-icon" class="fas fa-exclamation-triangle text-red-400"></i>
+    <div id="toast-text" class="font-medium text-sm"></div>
+</div>
+
+<script>
+// ── State machine ──────────────────────────────────────────────────────────────
+// idle | scanning | pausing | paused | completed
+let scanState    = 'idle';
+let sessionId    = null;
+let pollInterval = null;
+let pollAttempts = 0;
+
+// ── UI helpers ─────────────────────────────────────────────────────────────────
+function showToast(msg, type = 'info') {
+    const toast = document.getElementById('toast');
+    const icon  = document.getElementById('toast-icon');
+    const text  = document.getElementById('toast-text');
+    icon.className = type === 'success' ? 'fas fa-check-circle text-emerald-400'
+                   : type === 'warn'    ? 'fas fa-pause-circle text-amber-400'
+                   :                      'fas fa-exclamation-triangle text-red-400';
+    text.textContent = msg;
+    toast.classList.remove('hidden');
+    toast.style.display = 'flex';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { toast.style.display = 'none'; }, 5000);
+}
+
+function setStateBadge(text, color = 'text-gray-500') {
+    const el = document.getElementById('state-badge');
+    el.className = `text-xs font-mono ${color}`;
+    el.textContent = text;
+}
+
+function applyState(state) {
+    scanState = state;
+    const btnPause  = document.getElementById('btn-pause');
+    const btnResume = document.getElementById('btn-resume');
+    const btnReset  = document.getElementById('btn-reset');
+    const controls  = document.getElementById('controls-row');
+    const scanBtn   = document.getElementById('scan-btn');
+    const inputArea = document.getElementById('input-area');
+
+    // Always show controls row and reset once a session exists
+    controls.classList.toggle('hidden', !sessionId);
+    if (sessionId) btnReset.classList.remove('hidden');
+
+    if (state === 'scanning') {
+        btnPause.classList.remove('hidden');
+        btnResume.classList.add('hidden');
+        btnPause.classList.add('scanning-pulse');
+        inputArea.classList.add('opacity-40', 'pointer-events-none');
+        scanBtn.disabled = true;
+        scanBtn.classList.add('opacity-50');
+        document.getElementById('btn-text').textContent = 'Scanning…';
+        document.getElementById('btn-icon').className = 'fas fa-spinner fa-spin';
+        document.getElementById('status-dot').className = 'w-4 h-4 bg-red-500 rounded-full animate-ping';
+        document.getElementById('paused-banner').classList.add('hidden');
+        setProgressClass('shimmer');
+        setStateBadge('● scanning', 'text-red-400');
+    } else if (state === 'pausing') {
+        btnPause.classList.add('opacity-50', 'pointer-events-none');
+        setStateBadge('⏳ pausing…', 'text-amber-400');
+    } else if (state === 'paused') {
+        btnPause.classList.add('hidden');
+        btnResume.classList.remove('hidden');
+        btnPause.classList.remove('scanning-pulse');
+        inputArea.classList.remove('opacity-40', 'pointer-events-none');
+        scanBtn.disabled = false;
+        scanBtn.classList.remove('opacity-50');
+        document.getElementById('btn-text').textContent = 'New Scan';
+        document.getElementById('btn-icon').className = 'fas fa-plus';
+        document.getElementById('status-area').classList.add('hidden');
+        document.getElementById('paused-banner').classList.remove('hidden');
+        document.getElementById('results-area').classList.remove('hidden');
+        setProgressClass('paused');
+        setStateBadge('⏸ paused', 'text-amber-400');
+    } else if (state === 'completed') {
+        btnPause.classList.add('hidden');
+        btnResume.classList.add('hidden');
+        inputArea.classList.remove('opacity-40', 'pointer-events-none');
+        scanBtn.disabled = false;
+        scanBtn.classList.remove('opacity-50');
+        document.getElementById('btn-text').textContent = 'New Scan';
+        document.getElementById('btn-icon').className = 'fas fa-plus';
+        document.getElementById('status-area').classList.add('hidden');
+        document.getElementById('paused-banner').classList.add('hidden');
+        setProgressBarWidth(100);
+        setStateBadge('✓ completed', 'text-emerald-400');
+    } else if (state === 'idle') {
+        btnPause.classList.add('hidden');
+        btnResume.classList.add('hidden');
+        btnReset.classList.add('hidden');
+        controls.classList.add('hidden');
+        inputArea.classList.remove('opacity-40', 'pointer-events-none');
+        scanBtn.disabled = false;
+        scanBtn.classList.remove('opacity-50');
+        document.getElementById('btn-text').textContent = 'Scan Now';
+        document.getElementById('btn-icon').className = 'fas fa-arrow-right';
+        document.getElementById('status-area').classList.add('hidden');
+        document.getElementById('results-area').classList.add('hidden');
+        document.getElementById('paused-banner').classList.add('hidden');
+        setStateBadge('');
+    }
+}
+
+function setProgressClass(mode) {
+    const bar = document.getElementById('progress-bar');
+    bar.className = `h-full rounded-full transition-all duration-700 ${
+        mode === 'shimmer'  ? 'progress-shimmer' :
+        mode === 'paused'   ? 'progress-paused'  :
+                              'bg-emerald-500'
+    }`;
+}
+
+function setProgressBarWidth(pct) {
+    document.getElementById('progress-bar').style.width = pct + '%';
+}
+
+// ── Start Scan ─────────────────────────────────────────────────────────────────
+async function startScan() {
+    const domain = document.getElementById('domain-input').value.trim();
+    if (!domain) { showToast('Please enter a domain name'); return; }
+
+    // If currently paused, starting a NEW domain = reset first then scan
+    if (sessionId && scanState === 'paused') {
+        await doReset();
+    }
+
+    sessionId    = null;
+    pollAttempts = 0;
+
+    document.getElementById('status-area').classList.remove('hidden');
+    document.getElementById('results-area').classList.add('hidden');
+    document.getElementById('results-body').innerHTML = '';
+    document.getElementById('found-count').textContent = '';
+    setProgressBarWidth(8);
+    applyState('scanning');
+    document.getElementById('status-text').textContent = 'Generating permutations…';
+    document.getElementById('session-id-display').textContent = '—';
+
+    try {
+        const res  = await fetch('/api/scans', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url: domain})
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        sessionId = data.id;
+        document.getElementById('session-id-display').textContent = sessionId.substring(0, 8) + '…';
+        document.getElementById('controls-row').classList.remove('hidden');
+        document.getElementById('btn-reset').classList.remove('hidden');
+        document.getElementById('status-text').textContent = 'Resolving DNS…';
+
+        startPolling();
+    } catch (err) {
+        showToast('Scan failed: ' + err.message);
+        applyState('idle');
+    }
+}
+
+// ── Pause ──────────────────────────────────────────────────────────────────────
+async function pauseScan() {
+    if (!sessionId || scanState !== 'scanning') return;
+    applyState('pausing');
+    document.getElementById('status-text').textContent = 'Pausing after current item…';
+
+    try {
+        const res  = await fetch(`/api/scans/${sessionId}/pause`, {method: 'POST'});
+        const data = await res.json();
+        if (data.error) { showToast(data.error); applyState('scanning'); return; }
+        showToast('Scan pausing…', 'warn');
+        // Poll will detect status=paused and call applyState('paused')
+    } catch (err) {
+        showToast('Pause failed: ' + err.message);
+        applyState('scanning');
+    }
+}
+
+// ── Resume ─────────────────────────────────────────────────────────────────────
+async function resumeScan() {
+    if (!sessionId || scanState !== 'paused') return;
+    applyState('scanning');
+    document.getElementById('status-area').classList.remove('hidden');
+    document.getElementById('status-text').textContent = 'Resuming from checkpoint…';
+    setProgressBarWidth(20);
+
+    try {
+        const res  = await fetch(`/api/scans/${sessionId}/resume`, {method: 'POST'});
+        const data = await res.json();
+        if (data.error) { showToast(data.error); applyState('paused'); return; }
+        showToast('Scan resumed from where it stopped ▶', 'success');
+        pollAttempts = 0;
+        startPolling();
+    } catch (err) {
+        showToast('Resume failed: ' + err.message);
+        applyState('paused');
+    }
+}
+
+// ── Reset ──────────────────────────────────────────────────────────────────────
+async function resetScan() {
+    if (!sessionId) { applyState('idle'); document.getElementById('domain-input').value = ''; return; }
+    // native confirm() removed to fix issues in embedded browsers/automated environments
+    await doReset();
+}
+
+async function doReset() {
+    stopPolling();
+    if (sessionId) {
+        try { await fetch(`/api/scans/${sessionId}/reset`, {method: 'POST'}); } catch(_) {}
+    }
+    sessionId = null;
+    document.getElementById('domain-input').value = '';
+    document.getElementById('results-body').innerHTML = '';
+    document.getElementById('results-count-badge').textContent = '';
+    document.getElementById('found-count').textContent = '';
+    setProgressBarWidth(0);
+    applyState('idle');
+    showToast('Scan reset — ready for a new domain', 'success');
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────────
+function startPolling() {
+    stopPolling();
+    pollInterval = setInterval(doPoll, 1200);
+}
+function stopPolling() {
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+}
+
+async function doPoll() {
+    if (!sessionId) return;
+    pollAttempts++;
+
+    try {
+        // 1) Fetch status
+        const sr   = await fetch(`/api/scans/${sessionId}/status`);
+        const stat = await sr.json();
+        if (stat.error) return;
+
+        const dbStatus = stat.status;   // 'running' | 'paused' | 'completed'
+        const found    = stat.registered_count || 0;
+
+        // Update found-count display
+        if (found > 0) {
+            document.getElementById('found-count').textContent = `${found} found`;
+        }
+
+        // Advance progress bar using real server-side percentage
+        if (scanState === 'scanning' && stat.progress_pct != null) {
+            setProgressBarWidth(Math.max(5, stat.progress_pct));
+        }
+
+        // Update status text based on phase
+        if (dbStatus === 'running') {
+            const phase    = stat.phase;
+            const dnsDone  = stat.dns_done  || 0;
+            const dnsTotal = stat.dns_total || 0;
+            document.getElementById('status-text').textContent =
+                phase === 'dns'
+                    ? (dnsTotal > 0 ? `🔍 Resolving DNS — ${dnsDone} of ${dnsTotal} checked` : 'Resolving DNS…')
+                    : phase === 'enrichment'
+                    ? `⚡ Enriching threats — ${found} saved`
+                    : 'Scanning…';
+        }
+
+        // 2) Fetch any partial results to show live
+        if (found > 0) {
+            const dr = await fetch(`/api/scans/${sessionId}/domains`);
+            const domains = await dr.json();
+            if (domains && domains.length > 0) {
+                renderResults(domains, dbStatus !== 'completed');
+            }
+        }
+
+        // 3) Handle state transitions
+        if (dbStatus === 'paused' && scanState !== 'paused') {
+            stopPolling();
+            applyState('paused');
+        } else if (dbStatus === 'completed' && scanState !== 'completed') {
+            stopPolling();
+            applyState('completed');
+            // Final results refresh
+            const dr = await fetch(`/api/scans/${sessionId}/domains`);
+            const domains = await dr.json();
+            if (domains && domains.length > 0) renderResults(domains, false);
+            else document.getElementById('status-area').classList.add('hidden');
+            showToast(`✅ Scan complete — ${found} domains detected`, 'success');
+        }
+
+        // Timeout safety (3 minutes)
+        if (pollAttempts > 150 && scanState === 'scanning') {
+            stopPolling();
+            applyState('completed');
+        }
+
+    } catch (err) {
+        console.warn('Poll error:', err);
+    }
+}
+
+// ── Render Results ─────────────────────────────────────────────────────────────
+function renderResults(domains, isLive = false) {
+    document.getElementById('results-area').classList.remove('hidden');
+    if (!isLive) document.getElementById('status-area').classList.add('hidden');
+
+    document.getElementById('results-count-badge').textContent = `${domains.length} domains`;
+
+    const tbody = document.getElementById('results-body');
+    tbody.innerHTML = domains.map(d => {
+        const riskCls = d.risk_status === 'Malicious' ? 'text-red-400'
+                      : d.risk_status === 'Suspicious' ? 'text-amber-400'
+                      :                                   'text-emerald-400';
+        return `<tr class="result-row">
+            <td class="px-8 py-5 font-medium">${esc(d.domain)}</td>
+            <td class="px-8 py-5">
+                <span class="inline-flex items-center gap-2 font-semibold ${riskCls}">
+                    ${d.risk_emoji || '🟢'} ${d.risk_status || 'Safe'}
+                </span>
+            </td>
+            <td class="px-8 py-5">${d.risk_score ?? '—'}</td>
+            <td class="px-8 py-5">${d.age_days ?? '—'}</td>
+            <td class="px-8 py-5 text-gray-400 truncate max-w-xs">${esc(d.web_title || '—')}</td>
+            <td class="px-8 py-5">${esc(d.ip || '—')}</td>
+        </tr>`;
+    }).join('');
+}
+
+function esc(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function goToDashboard() {
+    window.location.href = sessionId ? `/dashboard#${sessionId}` : '/dashboard';
+}
+
+// ── Keyboard ───────────────────────────────────────────────────────────────────
+document.getElementById('domain-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && scanState === 'idle') startScan();
+});
+
+window.onload = () => {
+    if (typeof tailwind !== 'undefined') tailwind.config = { darkMode: 'class' };
+    applyState('idle');
+
+    // Pre-fill domain from ?domain= query param (used by dashboard Re-scan button)
+    const params = new URLSearchParams(window.location.search);
+    const preDomain = params.get('domain');
+    if (preDomain) {
+        document.getElementById('domain-input').value = preDomain;
+        // Auto-start after a brief visual pause
+        setTimeout(startScan, 500);
+    }
+};
+</script>
+</body>
+</html>

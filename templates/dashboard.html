@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhishGuard • Threat Intelligence Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', system-ui, sans-serif; }
+
+        /* Session cards */
+        .session-item { transition: all 0.15s ease; }
+
+        /* Stat cards hover lift */
+        .card { transition: all 0.25s cubic-bezier(0.4,0,0.2,1); }
+        .card:hover { transform: translateY(-3px); box-shadow: 0 20px 40px -10px rgba(0,0,0,0.4); }
+
+        /* Table rows */
+        .domain-row { transition: background-color 0.15s ease; }
+        .domain-row:hover { background-color: rgba(255,255,255,0.04); }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+
+        /* Running pulse badge */
+        @keyframes sbpulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        .sb-pulse { animation: sbpulse 1.5s infinite; }
+
+        /* Progress bar fill animation */
+        @keyframes progress-grow { from { width: 0% } }
+        .progress-fill { animation: progress-grow 0.6s ease-out; }
+
+        /* Modal slide-in */
+        @keyframes slide-in-right {
+            from { transform: translateX(100%); opacity: 0; }
+            to   { transform: translateX(0);    opacity: 1; }
+        }
+        #domain-modal-panel { animation: slide-in-right 0.28s cubic-bezier(0.4,0,0.2,1); }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+<div class="flex h-screen overflow-hidden">
+
+    <!-- ══════════════════════ SIDEBAR ══════════════════════ -->
+    <aside class="w-72 bg-gray-900 border-r border-gray-800 flex flex-col flex-shrink-0">
+
+        <!-- Brand -->
+        <div class="flex items-center gap-3 px-6 py-6 border-b border-gray-800">
+            <div class="w-10 h-10 bg-red-600 rounded-2xl flex items-center justify-center font-bold text-base">PG</div>
+            <h1 class="text-2xl font-bold tracking-tighter">PhishGuard</h1>
+        </div>
+
+        <!-- Nav -->
+        <nav class="px-4 py-4 space-y-1 border-b border-gray-800">
+            <a href="/" class="flex items-center gap-3 px-4 py-2.5 rounded-2xl text-gray-400 hover:bg-gray-800 hover:text-white text-sm transition">
+                <i class="fas fa-search w-4"></i> Scanner
+            </a>
+            <button onclick="navigateTo('dashboard')" class="w-full flex items-center gap-3 px-4 py-2.5 rounded-2xl text-sm transition {% if active_nav == 'dashboard' %}bg-gray-800 text-white{% else %}text-gray-400 hover:bg-gray-800 hover:text-white{% endif %}">
+                <i class="fas fa-tachometer-alt w-4"></i> Dashboard
+            </button>
+            {% if current_user.is_authenticated and current_user.is_admin %}
+            <a href="/admin/users" class="flex items-center gap-3 px-4 py-2.5 rounded-2xl text-gray-400 hover:bg-gray-800 hover:text-white text-sm transition">
+                <i class="fas fa-users w-4"></i> Manage Users
+            </a>
+            {% endif %}
+        </nav>
+
+        <!-- Active Scans List -->
+        <div class="flex-1 flex flex-col min-h-0 px-4 py-4">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 px-1">Active Scans</h3>
+                <button onclick="refreshSessions()"
+                    class="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 transition">
+                    <i class="fas fa-sync-alt text-[10px]"></i> Refresh
+                </button>
+            </div>
+
+            <!-- Session cards — each gets Pause/Resume/Reset buttons from script.js -->
+            <div id="sessions-list" class="space-y-2 overflow-y-auto flex-1 pr-1"></div>
+        </div>
+
+        <!-- Footer -->
+        <div class="px-6 py-4 border-t border-gray-800 text-xs text-gray-500">
+            NSA-Grade • Real-time • International
+        </div>
+    </aside>
+
+    <!-- ══════════════════════ MAIN CONTENT ══════════════════════ -->
+    <div class="flex-1 flex flex-col overflow-hidden">
+
+        <!-- Header -->
+        <header class="bg-gray-900 border-b border-gray-800 px-8 py-5 flex items-center justify-between flex-shrink-0">
+            <div class="flex items-center gap-3 min-w-0">
+                <h2 id="current-page-title" class="text-2xl font-semibold tracking-tight truncate">
+                    Threat Intelligence Dashboard
+                </h2>
+                <span id="current-session-badge"
+                    onclick="showSessionInfo()"
+                    class="hidden text-xs bg-blue-500/10 text-blue-400 px-3 py-1 rounded-3xl font-medium cursor-pointer whitespace-nowrap">
+                </span>
+            </div>
+            <div class="flex items-center gap-3">
+                <div class="flex items-center gap-2 bg-green-500/10 text-green-400 text-xs px-4 py-2 rounded-3xl">
+                    <div class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div> LIVE
+                </div>
+                <button onclick="exportAll()"
+                    class="bg-white text-gray-900 hover:bg-gray-100 px-5 py-2 rounded-2xl text-sm font-medium flex items-center gap-2 transition">
+                    <i class="fas fa-download"></i> Export All
+                </button>
+                {% if current_user.is_authenticated %}
+                <span class="text-gray-400 font-mono text-sm pl-2 pr-1"><i class="fas fa-user-circle text-gray-500 mr-1.5"></i>{{ current_user.username }}</span>
+                <a href="/logout" 
+                    class="bg-gray-800 text-gray-300 hover:bg-red-500/20 hover:text-red-400 border border-gray-700 hover:border-red-500/40 px-5 py-2 rounded-2xl text-sm font-medium flex items-center gap-2 transition ml-2">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </a>
+                {% endif %}
+            </div>
+        </header>
+
+        <!-- Scrollable body -->
+        <div class="flex-1 overflow-y-auto">
+            <div class="p-8">
+
+                <!-- Risk stat cards -->
+                <div class="grid grid-cols-3 gap-5 mb-8" id="risk-cards"></div>
+
+                <!-- Tabs Container (Dynamically managed by script.js) -->
+                <div id="tab-header-container" class="flex border-b border-gray-800 mb-6 w-full"></div>
+
+                <!-- ── Tab 0: Overview ── -->
+                <div id="tab-0" class="tab-content">
+                    <div class="grid grid-cols-12 gap-6">
+                        <div class="col-span-7 bg-gray-900 rounded-3xl p-8 card">
+                            <h3 class="text-lg font-semibold mb-6">Risk Overview</h3>
+                            <canvas id="riskChart" height="180"></canvas>
+                        </div>
+                        <div class="col-span-5 bg-gray-900 rounded-3xl p-8 card">
+                            <h3 class="text-lg font-semibold mb-6">Recent Activity</h3>
+                            <div id="recent-table" class="max-h-80 overflow-auto"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ── Tab 1: Detected Domains (isolated per session) ── -->
+                <div id="tab-1" class="tab-content hidden">
+                    <!-- scan-status-bar is injected here by script.js when a session is selected -->
+                    <div id="scan-status-bar" class="mb-4"></div>
+                    <div class="bg-gray-900 rounded-3xl overflow-hidden border border-gray-800">
+                        <table class="w-full table-fixed">
+                            <thead class="bg-gray-950 text-gray-400 text-xs uppercase tracking-wider border-b border-gray-800">
+                                <tr>
+                                    <th class="px-8 py-5 text-left w-[22%]">Domain</th>
+                                    <th class="px-8 py-5 text-left w-36">Risk</th>
+                                    <th class="px-8 py-5 text-left w-32">Score</th>
+                                    <th class="px-8 py-5 text-left w-36 text-center">Age (days)</th>
+                                    <th class="px-8 py-5 text-left w-[25%]">Web Title</th>
+                                    <th class="px-8 py-5 text-left w-48 text-center">IP</th>
+                                    <th class="px-8 py-5 text-right w-32">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="domains-body" class="text-sm font-mono divide-y divide-gray-800"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- ── Tab 2: Alerts ── -->
+                <div id="tab-2" class="tab-content hidden">
+                    <div id="alerts-list" class="space-y-3"></div>
+                </div>
+
+                <!-- ── Tab 3: Reports & Logs ── -->
+                <div id="tab-3" class="tab-content hidden">
+                    <div class="grid grid-cols-4 gap-5">
+                        <button onclick="downloadReport('csv')"
+                            class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition">
+                            <i class="fas fa-file-csv text-4xl mb-4 text-emerald-400"></i>
+                            <div class="font-semibold">CSV Export</div>
+                            <div class="text-xs text-gray-400 mt-1">All detected domains</div>
+                        </button>
+                        <button onclick="downloadReport('json')"
+                            class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition">
+                            <i class="fas fa-file-code text-4xl mb-4 text-blue-400"></i>
+                            <div class="font-semibold">JSON Export</div>
+                            <div class="text-xs text-gray-400 mt-1">Full enriched data</div>
+                        </button>
+                        <button onclick="downloadReport('pdf')"
+                            class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition opacity-50 cursor-not-allowed">
+                            <i class="fas fa-file-pdf text-4xl mb-4 text-red-400"></i>
+                            <div class="font-semibold">PDF Report</div>
+                            <div class="text-xs text-gray-400 mt-1">Coming soon</div>
+                        </button>
+                        <button onclick="downloadReport('txt')"
+                            class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition opacity-50 cursor-not-allowed">
+                            <i class="fas fa-file-alt text-4xl mb-4 text-amber-400"></i>
+                            <div class="font-semibold">Raw Logs</div>
+                            <div class="text-xs text-gray-400 mt-1">Coming soon</div>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- ── Tab 4: Session Logs / Debug (isolated per session) ── -->
+                <div id="tab-4" class="tab-content hidden">
+                    <div class="bg-gray-900 rounded-3xl p-8 border border-gray-800 font-mono text-sm max-w-4xl">
+                        <div class="flex justify-between items-center mb-6">
+                            <h3 class="text-white font-semibold">Active Execution Logs</h3>
+                            <span class="text-xs text-blue-400 border border-blue-500/30 px-3 py-1 rounded bg-blue-500/10">Live Debug</span>
+                        </div>
+                        <div id="session-logs-container" class="space-y-4 max-h-96 overflow-auto text-gray-400">
+                            <!-- Logs will be streamed here -->
+                            <div class="text-gray-500 italic text-center py-6">Waiting for execution context...</div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Toast notification -->
+<div id="toast"
+    style="display:none"
+    class="fixed bottom-8 right-8 z-50 bg-gray-900 border border-gray-700 text-white px-6 py-4 rounded-3xl shadow-2xl flex items-center gap-3 max-w-sm">
+    <i id="toast-icon" class="fas fa-exclamation-triangle text-red-400 text-lg"></i>
+    <div id="toast-text" class="font-medium text-sm leading-snug"></div>
+</div>
+
+<script src="/static/script.js"></script>
+<script>
+    // Initialize correct tab based on the active_tab routing variable
+    document.addEventListener("DOMContentLoaded", () => {
+        setTimeout(() => {
+            if (typeof switchTab === 'function') {
+                const targetTabStr = "{{ active_tab | default(0) }}";
+                const targetTab = targetTabStr ? parseInt(targetTabStr, 10) : 0;
+                
+                switchTab(targetTab);
+                
+                // Also update page title visually if on a specific tab
+                if (targetTab === 2) document.getElementById('current-page-title').textContent = 'Alerts';
+                if (targetTab === 3) document.getElementById('current-page-title').textContent = 'Reports & Logs';
+            }
+        }, 150);
+    });
+</script>
+
+<!-- ══════════════════ DOMAIN DETAIL MODAL ══════════════════ -->
+<div id="domain-modal-overlay"
+     onclick="closeDomainModal()"
+     class="fixed inset-0 z-40 bg-black/70 backdrop-blur-sm hidden">
+</div>
+
+<div id="domain-modal-panel"
+     class="fixed top-0 right-0 bottom-0 z-50 w-full max-w-2xl bg-gray-900 border-l border-gray-700
+            shadow-2xl overflow-y-auto hidden flex-col">
+
+    <!-- Modal Header -->
+    <div class="flex items-start justify-between px-8 py-6 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
+        <div class="min-w-0 flex-1 pr-4">
+            <div id="modal-domain-name" class="text-xl font-bold font-mono text-white truncate">—</div>
+            <div class="flex items-center gap-2 mt-2">
+                <span id="modal-risk-badge" class="px-3 py-1 text-xs font-semibold rounded-full">—</span>
+                <span id="modal-score-text" class="text-gray-400 text-sm">—</span>
+                <span id="modal-vt-badge" class="hidden px-3 py-1 text-xs font-semibold rounded-full bg-red-500/20 text-red-400"></span>
+            </div>
+        </div>
+        <button onclick="closeDomainModal()" id="modal-close-btn"
+            class="text-gray-400 hover:text-white transition p-2 rounded-xl hover:bg-gray-700 flex-shrink-0">
+            <i class="fas fa-times text-lg"></i>
+        </button>
+    </div>
+
+    <!-- Explanation bar -->
+    <div id="modal-explanation"
+         class="mx-8 mt-4 px-4 py-3 rounded-xl bg-gray-800 text-gray-300 text-sm hidden">
+    </div>
+
+    <!-- Modal Body -->
+    <div class="px-8 py-6 space-y-6" id="modal-body">
+
+        <!-- VirusTotal -->
+        <section>
+            <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
+                <i class="fas fa-shield-virus mr-2 text-red-400"></i>VirusTotal Analysis
+            </h3>
+            <div id="modal-vt-section" class="bg-gray-800 rounded-2xl p-5">
+                <div class="text-gray-500 text-sm">Loading…</div>
+            </div>
+        </section>
+
+        <!-- Risk Score Gauge -->
+        <section>
+            <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
+                <i class="fas fa-tachometer-alt mr-2 text-blue-400"></i>Risk Score
+            </h3>
+            <div class="bg-gray-800 rounded-2xl p-5">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-gray-400 text-sm">Score</span>
+                    <span id="modal-score-val" class="font-bold text-2xl">—</span>
+                </div>
+                <div class="h-3 bg-gray-700 rounded-full overflow-hidden">
+                    <div id="modal-score-bar" class="h-full rounded-full transition-all duration-700" style="width:0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 mt-1">
+                    <span>0 — Safe</span><span>50 — Suspicious</span><span>100 — Malicious</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- WHOIS -->
+        <section>
+            <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
+                <i class="fas fa-id-card mr-2 text-purple-400"></i>WHOIS Registration
+            </h3>
+            <div id="modal-whois" class="bg-gray-800 rounded-2xl p-5 grid grid-cols-2 gap-4 text-sm">
+                <div class="text-gray-500">Loading…</div>
+            </div>
+        </section>
+
+        <!-- SSL -->
+        <section>
+            <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
+                <i class="fas fa-lock mr-2 text-green-400"></i>SSL Certificate
+            </h3>
+            <div id="modal-ssl" class="bg-gray-800 rounded-2xl p-5 text-sm">
+                <div class="text-gray-500">Loading…</div>
+            </div>
+        </section>
+
+        <!-- DNS -->
+        <section>
+            <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
+                <i class="fas fa-network-wired mr-2 text-cyan-400"></i>DNS Records
+            </h3>
+            <div id="modal-dns" class="bg-gray-800 rounded-2xl p-5 text-sm">
+                <div class="text-gray-500">Loading…</div>
+            </div>
+        </section>
+
+        <!-- Web -->
+        <section>
+            <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
+                <i class="fas fa-globe mr-2 text-amber-400"></i>Web Presence
+            </h3>
+            <div id="modal-web" class="bg-gray-800 rounded-2xl p-5 text-sm">
+                <div class="text-gray-500">Loading…</div>
+            </div>
+        </section>
+
+        <!-- Actions -->
+        <section class="pb-4">
+            <a id="modal-vt-link" href="#" target="_blank" rel="noopener"
+               class="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white
+                      font-semibold text-sm py-3 rounded-2xl transition w-full">
+                <i class="fas fa-external-link-alt"></i> View on VirusTotal
+            </a>
+        </section>
+
+    </div>
+</div>
+</body>
+</html>
