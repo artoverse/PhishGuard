@@ -1,8 +1,8 @@
-# PhishGuard 
+# PhishGuard 🛡️
 
 PhishGuard is a real-time, highly concurrent web application designed to detect and analyze phishing lookalike domains. It uses a robust hybrid architecture that combines rapid DNS permutation scanning with deep threat enrichment and an evidence-weighted risk scoring engine.
 
-## Key Features
+## 🚀 Key Features
 
 - **DNS Permutation Scanning:** Leverages `dnstwist` to intelligently fuzz target domains, generating and resolving hundreds of potential lookalike domains in concurrent background threads.
 - **Deep Threat Enrichment:** Automatically probes active domains for:
@@ -57,13 +57,12 @@ PhishGuard is a real-time, highly concurrent web application designed to detect 
 1. **Login:** Access the dashboard at `http://127.0.0.1:5000` with the default admin credentials.
 2. **Start a Scan:** Enter a target brand domain (e.g., `example.com`) to begin the scan.
 3. **Monitor Live Logs:** Dive into the Session Logs interface to watch the backend worker threads run the DNS resolution and threat enrichment in pure real-time.
-4. **Review Results:** Evaluate the detected domains with their evidence-weighted scores (Safe , Suspicious , Malicious ), and review detailed breakdown reports highlighting specific risk components.
+4. **Review Results:** Evaluate the detected domains with their evidence-weighted scores (Safe 🟢, Suspicious 🟠, Malicious 🔴), and review detailed breakdown reports highlighting specific risk components.
 
-##  Contributing
+## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome! Feel free to check the issues page.
 
-##  License
+## 📄 License
 
 This project is licensed under the MIT License.
-

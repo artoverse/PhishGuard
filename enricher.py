@@ -4,7 +4,7 @@ import whois
 import ssl
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import current_app
 
 
@@ -16,16 +16,28 @@ def get_whois_info(domain):
         creation = w.creation_date
         if isinstance(creation, list):
             creation = creation[0]
+
         age_days = None
         if creation and isinstance(creation, datetime):
-            age_days = (datetime.now() - creation).days
+            # WHOIS datetimes may be timezone-aware (UTC) or naive.
+            # Normalise both sides to UTC-aware before subtracting.
+            if creation.tzinfo is not None:
+                now = datetime.now(timezone.utc)
+            else:
+                now = datetime.utcnow()
+            age_days = (now - creation).days
+
+        expiration = w.expiration_date
+        if isinstance(expiration, list):
+            expiration = expiration[0]
+
         return {
             'registrar': w.registrar,
             'creation_date': creation.isoformat() if creation else None,
             'expiration_date': (
-                w.expiration_date.isoformat()
-                if isinstance(w.expiration_date, datetime)
-                else str(w.expiration_date) if w.expiration_date else None
+                expiration.isoformat()
+                if isinstance(expiration, datetime)
+                else str(expiration) if expiration else None
             ),
             'age_days': age_days
         }

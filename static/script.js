@@ -589,6 +589,17 @@ function populateDomainModal(data) {
 
     document.getElementById('modal-score-text').textContent = `Score: ${data.risk_score}/100`;
 
+    // Action badge
+    const actionBadge = document.getElementById('modal-action-badge');
+    if (actionBadge && data.risk_action) {
+        actionBadge.textContent = data.risk_action;
+        actionBadge.className = 'px-3 py-1 text-xs font-medium rounded-full border ' +
+            (data.risk_status === 'Malicious'  ? 'border-red-500/40 text-red-400 bg-red-500/10' :
+             data.risk_status === 'Suspicious' ? 'border-amber-500/40 text-amber-400 bg-amber-500/10' :
+                                                 'border-emerald-500/40 text-emerald-400 bg-emerald-500/10');
+        actionBadge.classList.remove('hidden');
+    }
+
     // VT header badge
     const vtHeaderBadge = document.getElementById('modal-vt-badge');
     const vt = data.virustotal || {};
@@ -609,8 +620,8 @@ function populateDomainModal(data) {
     const barEl  = document.getElementById('modal-score-bar');
     const valEl  = document.getElementById('modal-score-val');
     valEl.textContent = score;
-    valEl.className = `font-bold text-2xl ${score >= 75 ? 'text-red-400' : score >= 45 ? 'text-amber-400' : 'text-emerald-400'}`;
-    barEl.className  = `h-full rounded-full transition-all duration-700 ${score >= 75 ? 'bg-red-500' : score >= 45 ? 'bg-amber-500' : 'bg-emerald-500'}`;
+    valEl.className = `font-bold text-2xl ${score >= 75 ? 'text-red-400' : score >= 28 ? 'text-amber-400' : 'text-emerald-400'}`;
+    barEl.className  = `h-full rounded-full transition-all duration-700 ${score >= 75 ? 'bg-red-500' : score >= 28 ? 'bg-amber-500' : 'bg-emerald-500'}`;
     setTimeout(() => { barEl.style.width = score + '%'; }, 50);
 
     // VirusTotal section

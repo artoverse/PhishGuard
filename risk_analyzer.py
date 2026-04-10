@@ -1,32 +1,45 @@
 """
-PhishGuard — Evidence-Weighted Risk Scorer
-==========================================
-Replaces the previous ML-based scoring approach.
+PhishGuard — Hybrid Risk Scorer (XGBoost + Evidence-Weighted Rules)
+====================================================================
+Combines a trained XGBoost classifier (UCI Phishing Dataset) with a
+deterministic evidence-weighted rule scorer for maximum accuracy.
 
-Root problem with ML + synthetic data:
-  Most dnstwist permutations share similar surface features (length, entropy, TLD),
-  so any ML model trained on synthetic distributions clusters 60%+ of domains at
-  nearly the same probability. Deterministic evidence scoring fixes this because
-  every domain's score is built from *what we actually observe on that specific domain*,
-  not from statistical patterns over artificial training data.
+Fusion strategy:
+  • XGBoost handles structural, WHOIS, SSL, and DNS features (trained on
+    11k real labelled samples — no synthetic data).
+  • Rule scorer handles VirusTotal intelligence, visual similarity (Levenshtein),
+    and live page-content signals — things no pre-trained model can know.
+  • Final score = 0.55 × ML score + 0.45 × rule score
+  • VirusTotal hard override is ALWAYS applied regardless of ML output.
 
-Scoring model (max 100 pts, 6 independent signal groups):
-  ┌────────────────────────────┬──────┐
-  │ Signal Group               │  Max │
-  ├────────────────────────────┼──────┤
-  │ VirusTotal Intelligence    │  50  │
-  │ Domain Age / WHOIS         │  25  │
-  │ Visual Similarity          │  20  │
-  │ Domain Structure           │  15  │
-  │ Page Content Analysis      │  20  │
-  │ SSL Certificate            │   5  │
-  └────────────────────────────┴──────┘
-  Total raw > 100 is clamped to 100.
+Scoring layout (max 100 pts):
+  ┌───────────────────────────────────┬──────┐
+  │ Signal Group                      │  Max │
+  ├───────────────────────────────────┼──────┤
+  │ XGBoost ML (UCI features)         │  60  │
+  │ VirusTotal Intelligence           │  50  │
+  │ Domain Age / WHOIS                │  25  │
+  │ Visual Similarity (Levenshtein)   │  20  │
+  │ Domain Structure (keywords/TLD)   │  15  │
+  │ Page Content Analysis             │  20  │
+  │ SSL Certificate                   │   5  │
+  └───────────────────────────────────┴──────┘
+  Raw total > 100 is clamped to 100.
 """
 
 import math
 import os
 from Levenshtein import distance as lev_distance
+
+try:
+    from ml_scorer import ml_score, is_model_available
+    _ML_AVAILABLE = True
+except ImportError:
+    _ML_AVAILABLE = False
+    def ml_score(*_, **__):
+        return {'available': False, 'probability': 0.5, 'ml_score': 0, 'features': {}, 'reason': 'ml_scorer not found'}
+    def is_model_available():
+        return False
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -280,8 +293,13 @@ def _score_ssl(ssl: dict) -> tuple[int, list[str]]:
 
 def analyze_risk(domain_data: dict, original: str) -> dict:
     """
-    Score a domain against a target brand using 6 independent evidence groups.
-    Each group is capped independently so no single signal can dominate.
+    Hybrid scorer: XGBoost ML + deterministic evidence rules.
+
+    Fusion:
+      • ML signal covers structural / WHOIS / SSL / DNS (trained on UCI dataset).
+      • Rule signal covers VirusTotal, visual similarity, page content.
+      • final_score = 0.55 × ml_raw + 0.45 × rule_raw  (clamped to 100)
+      • VT hard override always applies: if VT confirms ≥3 engines → score ≥ 75.
 
     Returns a dict compatible with the existing app.py / DB schema.
     """
@@ -291,7 +309,7 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
     ssl    = domain_data.get('ssl', {})
     web    = domain_data.get('web', {})
 
-    # ── Score each signal group independently ─────────────────────────────────
+    # ── Rule-based signal groups ──────────────────────────────────────────────
     vt_pts,       vt_sigs       = _score_virustotal(vt)
     age_pts,      age_sigs      = _score_domain_age(whois)
     sim_pts,      sim_sigs      = _score_visual_similarity(domain, original)
@@ -299,39 +317,103 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
     content_pts,  content_sigs  = _score_page_content(web)
     ssl_pts,      ssl_sigs      = _score_ssl(ssl)
 
-    raw_score = vt_pts + age_pts + sim_pts + struct_pts + content_pts + ssl_pts
-    score     = min(raw_score, 100)
+    rule_raw = vt_pts + age_pts + sim_pts + struct_pts + content_pts + ssl_pts
 
-    # ── VT confirmed = hard override regardless of score ──────────────────────
+    # ── XGBoost ML signal ─────────────────────────────────────────────────────
+    ml_result = ml_score(domain_data, original)
+    ml_raw    = ml_result.get('ml_score', 0)    # 0–60 range
+    ml_avail  = ml_result.get('available', False)
+    ml_prob   = ml_result.get('probability', 0.5)
+
+    # ── Hybrid fusion ─────────────────────────────────────────────────────────
+    if ml_avail:
+        # Weighted combination: ML covers structure/WHOIS/SSL/DNS;
+        # rules cover VT + content + visual similarity
+        fused = 0.55 * ml_raw + 0.45 * rule_raw
+    else:
+        # Fallback: pure rule-based scoring (original behaviour)
+        fused = float(rule_raw)
+
+    score = min(int(round(fused)), 100)
+
+    # ── VT confirmed = hard override regardless of ML output ──────────────────
     vt_confirmed = vt.get('available', False) and vt.get('malicious', 0) >= 3
-
     if vt_confirmed:
         score = max(score, 75)   # ensure classification is at least Malicious
 
-    # ── Risk classification ───────────────────────────────────────────────────
+    # ── Risk classification ─────────────────────────────────────────────────────
+    # Fixed 3-tier model:
+    #   🟢 Safe       score <  28  → registered lookalike, no active threat signals.
+    #                               Monitor passively.
+    #   🟠 Suspicious score 28–74  → phishing indicators present, not yet confirmed.
+    #                               Investigate manually.
+    #   🔴 Malicious  score >= 75  → active phishing or confirmed by threat intel.
+    #   or VT confirmed              Block immediately.
+    vt_missing = not vt.get('available', False)
+
     if score >= 75 or vt_confirmed:
         status     = 'Malicious'
         emoji      = '🔴'
-        confidence = 0.95 if vt_confirmed else 0.88
-    elif score >= 40:
+        action     = 'Block immediately'
+        confidence = 0.95 if vt_confirmed else (round(ml_prob, 2) if ml_avail else 0.88)
+    elif score >= 28:
         status     = 'Suspicious'
         emoji      = '🟠'
-        confidence = 0.80
+        action     = 'Investigate manually'
+        confidence = round(ml_prob, 2) if ml_avail else 0.80
     else:
         status     = 'Safe'
         emoji      = '🟢'
-        confidence = 0.92
+        action     = 'Monitor passively'
+        confidence = round(1 - ml_prob, 2) if ml_avail else 0.92
+
+    # ── Proximity override ────────────────────────────────────────────────────
+    # New phishing domains at dist==1 ALREADY cross the 28-pt Suspicious
+    # threshold naturally (age_pts 15-25 + sim_pts 18 + ssl_pts 5 > 28).
+    # Old established domains (goole.com: 9648 days, googlee.com: 9499 days)
+    # should stay Safe — they are parked, not actively attacking anyone.
+    #
+    # The only narrow case warranting an override: dist==1 domain where WHOIS
+    # age is completely unavailable (None) — hidden registration hiding age is
+    # itself a risk signal when combined with a near-identical name.
+    lev_dist = lev_distance(get_sld(domain), get_sld(original))
+    age_days_val = whois.get('age_days')
+    proximity_override = (
+        vt_missing and status == 'Safe' and
+        lev_dist == 1 and
+        age_days_val is None       # WHOIS age unknown → treat opaque domain as suspicious
+    )
+    if proximity_override:
+        status     = 'Suspicious'
+        emoji      = '🟠'
+        action     = 'Investigate manually'
+        confidence = round(ml_prob, 2) if ml_avail else 0.65
+
 
     # ── Build explanation ─────────────────────────────────────────────────────
     all_signals = vt_sigs + age_sigs + sim_sigs + struct_sigs + content_sigs + ssl_sigs
-    score_breakdown = (
-        f"VT:{vt_pts} Age:{age_pts} Sim:{sim_pts} "
-        f"Struct:{struct_pts} Content:{content_pts} SSL:{ssl_pts}"
-    )
+    if ml_avail:
+        score_breakdown = (
+            f"ML:{ml_raw}(p={ml_prob:.2f}) VT:{vt_pts} Age:{age_pts} "
+            f"Sim:{sim_pts} Struct:{struct_pts} Content:{content_pts} SSL:{ssl_pts}"
+        )
+        ml_note = f'GBM P(phish)={ml_prob:.1%}'
+        all_signals = [ml_note] + all_signals
+    else:
+        score_breakdown = (
+            f"VT:{vt_pts} Age:{age_pts} Sim:{sim_pts} "
+            f"Struct:{struct_pts} Content:{content_pts} SSL:{ssl_pts} [rule-only]"
+        )
+
     explanation = (
         f"Score {score}/100 [{score_breakdown}] — "
         + (', '.join(all_signals) if all_signals else 'no strong signals detected')
     )
+    if proximity_override:
+        explanation += (
+            f' ⚠️ Proximity flag: {lev_dist}-char lookalike — '
+            'verify manually (no VT data available)'
+        )
 
     # ── Features dict (kept for DB/modal compatibility) ───────────────────────
     age_raw = whois.get('age_days')
@@ -370,14 +452,22 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
         'score_struct':  struct_pts,
         'score_content': content_pts,
         'score_ssl':     ssl_pts,
+        # ML signal
+        'ml_probability':  ml_prob if ml_avail else None,
+        'ml_score':        ml_raw  if ml_avail else None,
+        'ml_available':    ml_avail,
+        'ml_features':     ml_result.get('features', {}),
     }
 
     return {
-        'risk_score':   score,
-        'risk_status':  status,
-        'risk_emoji':   emoji,
-        'features':     features,
-        'confidence':   confidence,
-        'explanation':  explanation,
-        'vt_confirmed': vt_confirmed,
+        'risk_score':    score,
+        'risk_status':   status,
+        'risk_emoji':    emoji,
+        'risk_action':   action,        # "Monitor passively / Investigate manually / Block immediately"
+        'features':      features,
+        'confidence':    confidence,
+        'explanation':   explanation,
+        'vt_confirmed':  vt_confirmed,
+        'ml_available':  ml_avail,
+        'ml_probability': ml_prob if ml_avail else None,
     }

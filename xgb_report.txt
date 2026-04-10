@@ -1,0 +1,32 @@
+HistGradientBoosting — PhishGuard Phishing Detector
+Dataset: Vrbancic et al. 2020 (58,645 real URLs)
+
+CV ROC-AUC : 0.9249 ± 0.0018
+CV Accuracy: 0.8462 ± 0.0027
+
+Test Accuracy : 0.8473
+Test ROC-AUC  : 0.9252
+
+              precision    recall  f1-score   support
+
+  Legitimate       0.85      0.82      0.84      5600
+    Phishing       0.84      0.87      0.86      6129
+
+    accuracy                           0.85     11729
+   macro avg       0.85      0.85      0.85     11729
+weighted avg       0.85      0.85      0.85     11729
+
+Permutation Feature Importances:
+  age_days: 0.1282
+  dot_count: 0.0884
+  domain_length: 0.0551
+  days_to_expiry: 0.0476
+  dns_mx_count: 0.0443
+  dns_a_count: 0.0266
+  redirect_count: 0.0246
+  has_at_symbol: 0.0226
+  dns_ns_count: 0.0215
+  ssl_valid: 0.0118
+  is_shortener: 0.0071
+  hyphen_count: 0.0048
+  is_ip_domain: 0.0031

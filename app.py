@@ -190,8 +190,11 @@ def _do_scan(session_id: str, domain: str,
                     work_queue.put(p)
                 state.work_queue = work_queue
 
-                n_threads = min(30, max(1, len(to_resolve)))
-                emit_scan_log(session_id, f"Booting {n_threads} concurrent threading.Thread workers for resolution.", 'info')
+                # DNS resolution is pure I/O — more threads = faster completion.
+                # dnstwist itself defaults to cpu_count+4; we scale with domain count
+                # so small scans stay lean while large ones (600 perms) finish fast.
+                n_threads = min(200, max(1, len(to_resolve)))
+                emit_scan_log(session_id, f"Booting {n_threads} concurrent DNS resolver threads for {len(to_resolve)} permutations.", 'info')
 
                 scanners = [dnstwist.Scanner(work_queue) for _ in range(n_threads)]
                 state.scanners = scanners
@@ -204,9 +207,20 @@ def _do_scan(session_id: str, domain: str,
                       f"({'resume' if pending_dns is not None else 'fresh'})...")
 
                 # Poll until queue drained OR stop requested
+                last_logged_pct = -1
                 while work_queue.unfinished_tasks > 0:
                     # Update dns_done from queue progress
                     state.dns_done = state.dns_total - work_queue.unfinished_tasks
+
+                    # Emit a progress log every 10% so the UI shows movement
+                    if state.dns_total > 0:
+                        pct = int((state.dns_done / state.dns_total) * 100)
+                        rounded = (pct // 10) * 10
+                        if rounded > last_logged_pct and rounded > 0:
+                            last_logged_pct = rounded
+                            emit_scan_log(session_id,
+                                f"DNS progress: {state.dns_done}/{state.dns_total} ({rounded}%) resolved...",
+                                'info')
                     if state.stop_event.is_set():
                         # ── PAUSE during DNS phase ───────────────────────────
                         for s in scanners:
@@ -242,7 +256,7 @@ def _do_scan(session_id: str, domain: str,
                         emit_scan_log(session_id, msg, 'info')
                         return
 
-                    time.sleep(0.25)
+                    time.sleep(0.1)   # tighter poll → faster completion detection
 
                 for s in scanners:
                     s.stop()
@@ -566,7 +580,28 @@ def api_scan():
         fuzzer = dnstwist.Fuzzer(domain)
         fuzzer.generate()
         all_domains = list(fuzzer.domains)
-        print(f"🔍 '{domain}' — {len(all_domains)} permutations generated")
+        raw_count = len(all_domains)
+
+        # ── Smart pre-filter: sort by Levenshtein distance, keep the closest ──
+        # Permutations 7+ edits from the original SLD are too different to
+        # plausibly fool anyone and massively inflate DNS resolution time.
+        # Keeping the 600 closest lookalikes covers all real phishing risk.
+        DNS_CAP = 600
+        original_sld = get_sld(domain)
+        originals = [p for p in all_domains if p.get('fuzzer') == '*original']
+        candidates = [p for p in all_domains if p.get('fuzzer') != '*original']
+
+        if len(candidates) > DNS_CAP:
+            candidates.sort(
+                key=lambda p: lev_distance(
+                    get_sld(str(p.get('domain', ''))), original_sld
+                )
+            )
+            candidates = candidates[:DNS_CAP]
+
+        all_domains = originals + candidates
+        print(f"🔍 '{domain}' — {raw_count} permutations generated, "
+              f"{len(candidates)} kept after Levenshtein pre-filter (cap={DNS_CAP})")
     except Exception as e:
         return jsonify({'error': f'Invalid domain: {str(e)}'}), 400
 
@@ -880,4 +915,4 @@ def handle_connect():
 
 if __name__ == '__main__':
     print("🚀 PhishGuard started → http://127.0.0.1:8000")
-    socketio.run(app, host='127.0.0.1', port=8000, debug=False, use_reloader=False)
+    socketio.run(app, host='127.0.0.1', port=8000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)

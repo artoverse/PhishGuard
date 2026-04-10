@@ -8,3 +8,8 @@ requests==2.32.3
 Levenshtein==0.26.1
 python-whois==0.9.6
 flask-login==0.6.3
+# ML dependencies
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+pandas>=2.0.0
+ucimlrepo>=0.0.6
