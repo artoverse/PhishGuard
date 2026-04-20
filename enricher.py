@@ -19,8 +19,6 @@ def get_whois_info(domain):
 
         age_days = None
         if creation and isinstance(creation, datetime):
-            # WHOIS datetimes may be timezone-aware (UTC) or naive.
-            # Normalise both sides to UTC-aware before subtracting.
             if creation.tzinfo is not None:
                 now = datetime.now(timezone.utc)
             else:
@@ -31,18 +29,48 @@ def get_whois_info(domain):
         if isinstance(expiration, list):
             expiration = expiration[0]
 
+        # Days until domain expires — short registration = throwaway/phishing indicator
+        days_to_expiry = None
+        if isinstance(expiration, datetime):
+            ref = datetime.now(timezone.utc) if expiration.tzinfo else datetime.utcnow()
+            days_to_expiry = (expiration - ref).days
+
+        # Registrant privacy detection — privacy/proxy service = hidden intent
+        PRIVACY_TOKENS = {
+            'privacy', 'private', 'proxy', 'protect', 'redacted', 'whoisguard',
+            'perfect privacy', 'domains by proxy', 'contact privacy', 'withheld',
+            'data protected', 'identity protect', 'register.com', 'shielded',
+        }
+        registrant_fields = ' '.join(filter(None, [
+            str(w.org or ''), str(w.name or ''),
+            str(getattr(w, 'registrant_name', '') or ''),
+            str(getattr(w, 'registrant_org',  '') or ''),
+        ])).lower()
+        registrant_is_private = any(t in registrant_fields for t in PRIVACY_TOKENS)
+
+        # Registrant country from WHOIS (may be None)
+        registrant_country = (
+            str(getattr(w, 'country', '') or
+                getattr(w, 'registrant_country', '') or '').strip().upper()
+        ) or None
+
         return {
-            'registrar': w.registrar,
-            'creation_date': creation.isoformat() if creation else None,
+            'registrar':            w.registrar,
+            'creation_date':        creation.isoformat() if creation else None,
             'expiration_date': (
                 expiration.isoformat()
                 if isinstance(expiration, datetime)
                 else str(expiration) if expiration else None
             ),
-            'age_days': age_days
+            'age_days':             age_days,
+            'days_to_expiry':       days_to_expiry,
+            'registrant_is_private': registrant_is_private,
+            'registrant_country':   registrant_country,
         }
     except Exception as e:
         return {'error': f'WHOIS failed: {str(e)}'}
+
+
 
 
 # ─── Web Fetcher + Content Phishing Analysis ─────────────────────────────────
@@ -53,11 +81,11 @@ def _analyse_page_content(soup, resp, domain, original_domain):
     Returns a dict of bool indicators — no extra HTTP request needed.
     """
     indicators = {
-        'has_password_form':       False,
+        'has_password_form':        False,
         'has_external_form_action': False,
-        'brand_in_page':           False,
-        'redirect_to_external':    False,
-        'has_login_form':          False,
+        'brand_in_page':            False,
+        'redirect_to_external':     False,
+        'has_login_form':           False,
     }
     try:
         # 1. Password input present → credential harvesting page
@@ -73,25 +101,36 @@ def _analyse_page_content(soup, resp, domain, original_domain):
                 break
 
         # 3. Login-related form (username + password fields together)
-        user_inputs = soup.find_all('input', {'type': lambda t: t and t.lower() in ('text', 'email')})
+        user_inputs = soup.find_all(
+            'input',
+            {'type': lambda t: t and t.lower() in ('text', 'email', 'tel')}
+        )
         if user_inputs and password_inputs:
             indicators['has_login_form'] = True
 
-        # 4. Target brand name appears in page title or visible headings
+        # 4. Target brand name in page content
+        # Search: title, headings, body text (first 5000 chars) and alt/aria attrs
+        # Min brand length = 3 so short brands like 'dhl', 'ups', 'hsbc' are caught.
         brand = original_domain.split('.')[0].lower()   # e.g. 'paypal' from 'paypal.com'
-        page_text = ''
-        if soup.title and soup.title.string:
-            page_text += soup.title.string.lower()
-        for tag in soup.find_all(['h1', 'h2', 'h3']):
-            page_text += ' ' + tag.get_text().lower()
-        if len(brand) >= 4 and brand in page_text:
-            indicators['brand_in_page'] = True
+        if len(brand) >= 3:
+            page_text = ''
+            if soup.title and soup.title.string:
+                page_text += soup.title.string.lower() + ' '
+            for tag in soup.find_all(['h1', 'h2', 'h3', 'p', 'a', 'button', 'span', 'li']):
+                page_text += tag.get_text(' ', strip=True).lower() + ' '
+                if len(page_text) > 5000:
+                    break   # enough signal, stop scanning
+            if brand in page_text:
+                indicators['brand_in_page'] = True
 
         # 5. Final URL is on a completely different domain (external redirect)
-        final_host = resp.url.split('/')[2].lower().lstrip('www.')
-        self_host  = domain.lower().lstrip('www.')
-        if final_host and self_host not in final_host and final_host not in self_host:
-            indicators['redirect_to_external'] = True
+        try:
+            final_host = resp.url.split('/')[2].lower().lstrip('www.')
+            self_host  = domain.lower().lstrip('www.')
+            if final_host and self_host not in final_host and final_host not in self_host:
+                indicators['redirect_to_external'] = True
+        except Exception:
+            pass
 
     except Exception:
         pass   # non-fatal — missing indicators default to False
@@ -100,13 +139,25 @@ def _analyse_page_content(soup, resp, domain, original_domain):
 
 
 def fetch_web_content(domain, original_domain=''):
-    results = {}
+    """
+    Fetch page over HTTPS first, fall back to HTTP if it fails.
+    Breaks early once one protocol succeeds — no double-fetching.
+    """
+    results = {'https': {'error': 'unreachable'}, 'http': {'error': 'unreachable'}}
+    # Realistic browser UA — avoids WAF blocks that reject bot strings
+    UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+          'AppleWebKit/537.36 (KHTML, like Gecko) '
+          'Chrome/124.0.0.0 Safari/537.36')
     for proto in ['https', 'http']:
         try:
             resp = requests.get(
                 f"{proto}://{domain}",
                 timeout=8,
-                headers={'User-Agent': 'Mozilla/5.0 (compatible; PhishGuard/1.0)'},
+                headers={
+                    'User-Agent': UA,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
                 allow_redirects=True
             )
             soup = BeautifulSoup(resp.text, 'html.parser')
@@ -114,15 +165,15 @@ def fetch_web_content(domain, original_domain=''):
             if soup.title and soup.title.string:
                 title = soup.title.string.strip()[:200]
 
-            # Analyse page content for phishing signals (uses HTML already in memory)
             content_signals = _analyse_page_content(soup, resp, domain, original_domain)
 
             results[proto] = {
                 'status':    resp.status_code,
                 'title':     title,
                 'final_url': resp.url,
-                **content_signals,   # merge all phishing content indicators
+                **content_signals,
             }
+            break   # success — no need to try the other protocol
         except Exception:
             results[proto] = {'error': 'unreachable'}
     return results

@@ -42,6 +42,28 @@
             to   { transform: translateX(0);    opacity: 1; }
         }
         #domain-modal-panel { animation: slide-in-right 0.28s cubic-bezier(0.4,0,0.2,1); }
+
+        /* Alert settings modal */
+        @keyframes fade-scale-in {
+            from { opacity: 0; transform: scale(0.95) translateY(-8px); }
+            to   { opacity: 1; transform: scale(1)   translateY(0);    }
+        }
+        #alert-modal-box { animation: fade-scale-in 0.22s cubic-bezier(0.4,0,0.2,1); }
+
+        /* Toggle switch */
+        .toggle-switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute; cursor: pointer; inset: 0;
+            background: #374151; border-radius: 24px; transition: 0.25s;
+        }
+        .toggle-slider:before {
+            content: ''; position: absolute;
+            height: 18px; width: 18px; left: 3px; bottom: 3px;
+            background: white; border-radius: 50%; transition: 0.25s;
+        }
+        .toggle-switch input:checked + .toggle-slider { background: #3b82f6; }
+        .toggle-switch input:checked + .toggle-slider:before { transform: translateX(20px); }
     </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -112,6 +134,15 @@
                 <button onclick="exportAll()"
                     class="bg-white text-gray-900 hover:bg-gray-100 px-5 py-2 rounded-2xl text-sm font-medium flex items-center gap-2 transition">
                     <i class="fas fa-download"></i> Export All
+                </button>
+                <!-- Alert Settings Bell -->
+                <button onclick="openAlertModal()"
+                    id="alert-bell-btn"
+                    title="Email Alert Settings"
+                    class="relative bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 hover:text-white
+                           px-3 py-2 rounded-2xl text-sm transition flex items-center gap-2">
+                    <i class="fas fa-bell"></i>
+                    <span id="alert-bell-dot" class="hidden absolute top-1 right-1 w-2 h-2 bg-blue-400 rounded-full"></span>
                 </button>
                 {% if current_user.is_authenticated %}
                 <span class="text-gray-400 font-mono text-sm pl-2 pr-1"><i class="fas fa-user-circle text-gray-500 mr-1.5"></i>{{ current_user.username }}</span>
@@ -231,6 +262,103 @@
     <div id="toast-text" class="font-medium text-sm leading-snug"></div>
 </div>
 
+<!-- ════════════════ ALERT SETTINGS MODAL ════════════════ -->
+<div id="alert-modal-overlay"
+     onclick="closeAlertModal()"
+     class="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm hidden">
+</div>
+<div id="alert-modal-box"
+     class="fixed inset-0 z-[70] hidden flex items-center justify-center p-4">
+    <div class="bg-gray-900 border border-gray-700 rounded-3xl shadow-2xl w-full max-w-md"
+         onclick="event.stopPropagation()">
+
+        <!-- Modal Header -->
+        <div class="flex items-center justify-between px-8 py-6 border-b border-gray-800">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 bg-blue-600/20 border border-blue-500/30 rounded-2xl flex items-center justify-center">
+                    <i class="fas fa-bell text-blue-400"></i>
+                </div>
+                <div>
+                    <h3 class="font-semibold text-white">Email Alert Settings</h3>
+                    <p class="text-xs text-gray-400 mt-0.5">Get notified when threats are detected</p>
+                </div>
+            </div>
+            <button onclick="closeAlertModal()" class="text-gray-500 hover:text-white transition p-1 rounded-xl hover:bg-gray-800">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+
+        <!-- SMTP Status Banner -->
+        <div id="smtp-status-banner" class="mx-8 mt-6 px-4 py-3 rounded-2xl text-xs font-medium hidden"></div>
+
+        <!-- Settings Form -->
+        <div class="px-8 py-6 space-y-6">
+
+            <!-- Email Input -->
+            <div>
+                <label class="block text-xs font-semibold text-gray-400 uppercase tracking-widest mb-2">
+                    Recipient Email Address
+                </label>
+                <input id="alert-email-input"
+                       type="email"
+                       placeholder="you@yourorg.com"
+                       class="w-full bg-gray-800 border border-gray-700 text-white rounded-2xl px-4 py-3 text-sm
+                              focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition
+                              placeholder-gray-600">
+                <p class="text-xs text-gray-500 mt-1.5">Leave blank to disable email alerts for your account.</p>
+            </div>
+
+            <!-- Malicious-only Toggle -->
+            <div class="flex items-center justify-between">
+                <div>
+                    <div class="text-sm font-medium text-white">High-risk only</div>
+                    <div class="text-xs text-gray-500 mt-0.5">Only email when <span class="text-red-400 font-semibold">Malicious</span> domains are found</div>
+                </div>
+                <label class="toggle-switch flex-shrink-0">
+                    <input type="checkbox" id="alert-malicious-only-toggle">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+
+            <!-- Divider -->
+            <div class="border-t border-gray-800"></div>
+
+            <!-- Send Test Email -->
+            <div>
+                <div class="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-2">Verify Configuration</div>
+                <div class="flex gap-2">
+                    <input id="alert-test-email-input"
+                           type="email"
+                           placeholder="Test recipient (defaults to above)"
+                           class="flex-1 bg-gray-800 border border-gray-700 text-white rounded-2xl px-4 py-2.5 text-sm
+                                  focus:outline-none focus:border-blue-500 transition placeholder-gray-600">
+                    <button onclick="sendTestEmail()"
+                            id="test-email-btn"
+                            class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2.5 rounded-2xl text-sm font-medium
+                                   flex items-center gap-2 transition whitespace-nowrap flex-shrink-0">
+                        <i class="fas fa-paper-plane text-xs"></i> Send Test
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer: Save / Cancel -->
+        <div class="flex gap-3 px-8 pb-8">
+            <button onclick="closeAlertModal()"
+                class="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700
+                       rounded-2xl py-3 text-sm font-medium transition">
+                Cancel
+            </button>
+            <button onclick="saveAlertSettings()"
+                id="alert-save-btn"
+                class="flex-1 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl py-3 text-sm
+                       font-semibold flex items-center justify-center gap-2 transition">
+                <i class="fas fa-save text-xs"></i> Save Settings
+            </button>
+        </div>
+    </div>
+</div>
+
 <script src="/static/script.js"></script>
 <script>
     // Initialize correct tab based on the active_tab routing variable
@@ -277,10 +405,6 @@
         </button>
     </div>
 
-    <!-- Explanation bar -->
-    <div id="modal-explanation"
-         class="mx-8 mt-4 px-4 py-3 rounded-xl bg-gray-800 text-gray-300 text-sm hidden">
-    </div>
 
     <!-- Modal Body -->
     <div class="px-8 py-6 space-y-6" id="modal-body">
@@ -295,21 +419,30 @@
             </div>
         </section>
 
-        <!-- Risk Score Gauge -->
+        <!-- Risk Score Breakdown -->
         <section>
             <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-3">
                 <i class="fas fa-tachometer-alt mr-2 text-blue-400"></i>Risk Score
             </h3>
             <div class="bg-gray-800 rounded-2xl p-5">
+                <!-- Total score bar -->
                 <div class="flex items-center justify-between mb-2">
-                    <span class="text-gray-400 text-sm">Score</span>
+                    <span class="text-gray-400 text-sm">Total Score</span>
                     <span id="modal-score-val" class="font-bold text-2xl">—</span>
                 </div>
-                <div class="h-3 bg-gray-700 rounded-full overflow-hidden">
+                <div class="h-3 bg-gray-700 rounded-full overflow-hidden mb-1">
                     <div id="modal-score-bar" class="h-full rounded-full transition-all duration-700" style="width:0%"></div>
                 </div>
-                <div class="flex justify-between text-xs text-gray-500 mt-1">
-                    <span>0 — Safe</span><span>28 — Suspicious</span><span>75–100 — Malicious</span>
+                <div class="flex justify-between text-xs text-gray-500 mb-5">
+                    <span>0 — Safe</span><span id="modal-thresh-sus">22 — Suspicious</span><span id="modal-thresh-mal">52–100 — Malicious</span>
+                </div>
+
+                <!-- Per-signal breakdown -->
+                <div class="border-t border-gray-700 pt-4">
+                    <p class="text-xs text-gray-500 uppercase tracking-wider mb-3">Signal Breakdown</p>
+                    <div id="modal-score-breakdown" class="space-y-2">
+                        <!-- Injected by JS -->
+                    </div>
                 </div>
             </div>
         </section>

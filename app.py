@@ -23,6 +23,7 @@ from enricher import enrich_domain
 from risk_analyzer import analyze_risk, get_sld
 from Levenshtein import distance as lev_distance
 from models import db, ScanSession, DetectedDomain, Alert
+from mailer import send_threat_alert, send_test_email as mailer_send_test
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 app.config.from_object(Config)
@@ -82,12 +83,23 @@ with app.app_context():
     except Exception:
         db.session.rollback()
         
-    # NEW: Migrate ScanSession to support user isolation
+    # Migrate ScanSession to support user isolation
     try:
         db.session.execute(db.text("ALTER TABLE scan_session ADD COLUMN user_id INTEGER REFERENCES user(id)"))
         db.session.commit()
     except Exception:
         db.session.rollback()
+
+    # Migrate User to add email alert preference columns
+    for col_def in [
+        "ALTER TABLE user ADD COLUMN alert_email VARCHAR(255)",
+        "ALTER TABLE user ADD COLUMN alert_malicious_only BOOLEAN DEFAULT 0",
+    ]:
+        try:
+            db.session.execute(db.text(col_def))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
     
     # Auto-create default admin user if no users exist
     from models import User
@@ -95,7 +107,7 @@ with app.app_context():
     if not admin:
         default_admin = User(
             username='admin',
-            password_hash=generate_password_hash('admin'),
+            password_hash=generate_password_hash('admin', method='pbkdf2:sha256'),
             is_approved=True,
             is_admin=True
         )
@@ -121,6 +133,24 @@ with app.app_context():
             print(f'⚠️  Marked {len(orphans)} orphaned running sessions as paused on startup')
     except Exception as _e:
         db.session.rollback()
+
+    # Auto-fix scrypt hashes that are incompatible with Python 3.9 / LibreSSL.
+    # If any user was registered with a Python that had OpenSSL (which supports scrypt),
+    # their hashes will crash check_password_hash on LibreSSL systems.
+    # We reset those passwords to 'changeme' so the user can log in again.
+    try:
+        all_users = User.query.all()
+        rehashed = []
+        for u in all_users:
+            if u.password_hash and u.password_hash.startswith('scrypt:'):
+                u.password_hash = generate_password_hash('changeme', method='pbkdf2:sha256')
+                rehashed.append(u.username)
+        if rehashed:
+            db.session.commit()
+            print(f'⚠️  Rehashed scrypt passwords for {rehashed} → temp password is "changeme"')
+    except Exception as _e:
+        db.session.rollback()
+        print(f'⚠️  Could not migrate scrypt hashes: {_e}')
 
 # ─── Per-session Scan State ───────────────────────────────────────────────────
 
@@ -391,6 +421,8 @@ def _do_scan(session_id: str, domain: str,
         msg = f"SCAN COMPLETE — {enriched_count} active threats successfully extracted and vaulted."
         print(f"🎯 [{session_id[:8]}] " + msg)
         emit_scan_log(session_id, msg, 'success')
+        # Trigger email alert (non-blocking, runs in daemon thread)
+        _send_completion_email(session_id, domain, enriched_count)
 
 
 def _set_db_status(session_id, status, count=None):
@@ -404,6 +436,65 @@ def _set_db_status(session_id, status, count=None):
             db.session.commit()
     except Exception as e:
         print(f"DB update error: {e}")
+
+
+def _send_completion_email(session_id: str, domain: str, threat_count: int) -> None:
+    """
+    Fire-and-forget email alert when a scan finishes.
+    Skips silently if user has no alert_email configured or no threats found.
+    Must be called from inside an app context (already true at scan end).
+    """
+    try:
+        from models import User
+        session_obj = db.session.get(ScanSession, session_id)
+        if not session_obj or not session_obj.user_id:
+            return
+        user = db.session.get(User, session_obj.user_id)
+        if not user or not user.alert_email:
+            return   # alerting not configured for this user
+
+        # Fetch all threats for this session
+        threats_qs = DetectedDomain.query.filter(
+            DetectedDomain.session_id == session_id,
+            DetectedDomain.risk_status.in_(['Malicious', 'Suspicious'])
+        ).order_by(DetectedDomain.risk_score.desc()).all()
+
+        if not threats_qs:
+            print(f"[mailer] No threats found for {session_id[:8]} — skipping email")
+            return
+
+        # If malicious_only, skip when there are no Malicious results
+        malicious_threats = [t for t in threats_qs if t.risk_status == 'Malicious']
+        if user.alert_malicious_only and not malicious_threats:
+            print(f"[mailer] No Malicious threats found for {session_id[:8]} (malicious_only=True) — skipping")
+            return
+
+        threat_dicts = [{
+            'domain':      t.domain,
+            'risk_status': t.risk_status,
+            'risk_score':  t.risk_score,
+            'enriched_data': t.enriched_data or {},
+        } for t in threats_qs]
+
+        smtp_cfg = {
+            'server':     app.config.get('MAIL_SERVER', ''),
+            'port':       app.config.get('MAIL_PORT', 587),
+            'username':   app.config.get('MAIL_USERNAME', ''),
+            'password':   app.config.get('MAIL_PASSWORD', ''),
+            'from_email': app.config.get('ALERT_FROM_EMAIL', ''),
+            'use_tls':    app.config.get('MAIL_USE_TLS', True),
+        }
+
+        print(f"[mailer] Firing alert for {domain} → {user.alert_email} ({len(threat_dicts)} threats)")
+        send_threat_alert(
+            to_email=user.alert_email,
+            session_domain=domain,
+            threats=threat_dicts,
+            smtp_config=smtp_cfg,
+            malicious_only=bool(user.alert_malicious_only),
+        )
+    except Exception as exc:
+        print(f"[mailer] _send_completion_email error: {exc}")
 
 
 # ─── Auth Routes ──────────────────────────────────────────────────────────────
@@ -436,7 +527,7 @@ def register():
         else:
             new_user = User(
                 username=username,
-                password_hash=generate_password_hash(password),
+                password_hash=generate_password_hash(password, method='pbkdf2:sha256'),
                 is_approved=False,
                 is_admin=False
             )
@@ -545,6 +636,70 @@ def api_delete_user(user_id):
     db.session.delete(user)
     db.session.commit()
     return jsonify({'success': True, 'message': f'User {user.username} was permanently deleted.'})
+
+# ─── API: Email Alert Settings ────────────────────────────────────────────────
+
+@app.route('/api/alert-settings', methods=['GET'])
+@login_required
+def api_get_alert_settings():
+    """Return the current user's email alert preferences."""
+    from models import User
+    user = db.session.get(User, current_user.id)
+    smtp_ok = bool(app.config.get('MAIL_SERVER') and app.config.get('MAIL_USERNAME'))
+    return jsonify({
+        'alert_email':         user.alert_email or '',
+        'alert_malicious_only': bool(user.alert_malicious_only),
+        'smtp_configured':     smtp_ok,
+        'smtp_server':         app.config.get('MAIL_SERVER', '') or '',
+    })
+
+@app.route('/api/alert-settings', methods=['POST'])
+@login_required
+def api_save_alert_settings():
+    """Save the current user's email alert preferences."""
+    data = request.get_json(silent=True) or {}
+    from models import User
+    user = db.session.get(User, current_user.id)
+
+    raw_email = str(data.get('alert_email', '')).strip()
+    # Basic email validation
+    if raw_email and ('@' not in raw_email or '.' not in raw_email.split('@')[-1]):
+        return jsonify({'error': 'Invalid email address'}), 400
+
+    user.alert_email = raw_email or None
+    user.alert_malicious_only = bool(data.get('alert_malicious_only', False))
+    db.session.commit()
+    return jsonify({'success': True, 'alert_email': user.alert_email or '',
+                    'alert_malicious_only': bool(user.alert_malicious_only)})
+
+@app.route('/api/test-email', methods=['POST'])
+@login_required
+def api_test_email():
+    """Send a test email to verify the user's SMTP configuration."""
+    data = request.get_json(silent=True) or {}
+    to_email = str(data.get('to_email', '')).strip() or (current_user.alert_email or '')
+
+    if not to_email:
+        return jsonify({'error': 'Provide a recipient email address'}), 400
+
+    import re
+    if not re.match(r'^[^\s@]+@[^\s@]+\.[^\s@]+$', to_email):
+        return jsonify({'error': f'"{to_email}" is not a valid email address (must be user@domain.com format)'}), 400
+
+    smtp_cfg = {
+        'server':     app.config.get('MAIL_SERVER', ''),
+        'port':       app.config.get('MAIL_PORT', 587),
+        'username':   app.config.get('MAIL_USERNAME', ''),
+        'password':   app.config.get('MAIL_PASSWORD', ''),
+        'from_email': app.config.get('ALERT_FROM_EMAIL', ''),
+        'use_tls':    app.config.get('MAIL_USE_TLS', True),
+    }
+
+    result = mailer_send_test(to_email, smtp_cfg)
+    if result['ok']:
+        return jsonify({'success': True, 'message': f'Test email sent to {to_email}'})
+    else:
+        return jsonify({'error': result['error']}), 500
 
 # ─── API: Sessions ────────────────────────────────────────────────────────────
 
@@ -806,7 +961,46 @@ def api_domain_detail(sid, domain_name):
         },
         # Risk breakdown
         'explanation': ed.get('explanation', '—'),
+        # Per-signal score breakdown — re-run analyzer to get individual components
+        'score_breakdown': _get_score_breakdown(ed, d.domain, ed.get('original_domain', '')),
+        'risk_action':     _get_risk_action(d.risk_status),
     })
+
+def _get_risk_action(status):
+    return {'Malicious': 'Block immediately',
+            'Suspicious': 'Investigate manually'}.get(status, 'Monitor passively')
+
+def _get_score_breakdown(ed, domain, original):
+    """Re-run the individual scoring functions to get per-signal pts for the modal."""
+    try:
+        from risk_analyzer import (
+            _score_virustotal, _score_domain_age, _score_visual_similarity,
+            _score_domain_structure, _score_page_content, _score_ssl
+        )
+        vt_pts,      _ = _score_virustotal(ed.get('virustotal', {}))
+        age_pts,     _ = _score_domain_age(ed.get('whois', {}))
+        sim_pts,     _ = _score_visual_similarity(domain, original)
+        struct_pts,  _ = _score_domain_structure(domain)
+        content_pts, _ = _score_page_content(ed.get('web', {}))
+        ssl_pts,     _ = _score_ssl(ed.get('ssl', {}))
+        # ML from stored explanation string (avoid re-scoring for speed)
+        import re
+        expl = ed.get('explanation', '')
+        ml_match = re.search(r'ML:(\d+)', expl)
+        ml_pts = int(ml_match.group(1)) if ml_match else 0
+        prob_match = re.search(r'p=([\d.]+)', expl)
+        ml_prob = float(prob_match.group(1)) if prob_match else None
+        return {
+            'ml':      {'pts': ml_pts,      'max': 60,  'label': 'ML Model',       'prob': ml_prob},
+            'vt':      {'pts': vt_pts,      'max': 40,  'label': 'VirusTotal'},
+            'age':     {'pts': age_pts,     'max': 40,  'label': 'Domain Age'},
+            'sim':     {'pts': sim_pts,     'max': 22,  'label': 'Visual Similarity'},
+            'struct':  {'pts': struct_pts,  'max': 15,  'label': 'Domain Structure'},
+            'content': {'pts': content_pts, 'max': 20,  'label': 'Page Content'},
+            'ssl':     {'pts': ssl_pts,     'max': 5,   'label': 'SSL Certificate'},
+        }
+    except Exception:
+        return {}
 
 @app.route('/api/scans/<sid>/status')
 def api_scan_status(sid):

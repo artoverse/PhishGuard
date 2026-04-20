@@ -119,8 +119,14 @@ def _score_virustotal(vt: dict) -> tuple[int, list[str]]:
 
 def _score_domain_age(whois: dict) -> tuple[int, list[str]]:
     """
-    Domain age and WHOIS availability.
-    Max 25 points.
+    Domain age + WHOIS registration quality signals.
+    Max 40 points (raised from 25 to accommodate new WHOIS signals).
+
+    Signals scored:
+      • Domain creation age              (0–25 pts)
+      • Days until expiry                (0–12 pts) — 1-yr throwaway registrations
+      • WHOIS registrant privacy service (0–5  pts) — hidden owner
+      • Registrant country risk          (0–4  pts) — high-abuse ccTLD
     """
     pts = 0
     signals = []
@@ -128,11 +134,11 @@ def _score_domain_age(whois: dict) -> tuple[int, list[str]]:
     age = whois.get('age_days')
 
     if has_error or age is None:
-        # WHOIS blocked / failed → suspicious on its own
         pts = 12
         signals.append('WHOIS blocked or unavailable')
         return pts, signals
 
+    # ── Age of domain since creation ──────────────────────────────────────────
     if age < 7:
         pts = 25
         signals.append(f'domain only {age}d old (very new)')
@@ -147,9 +153,44 @@ def _score_domain_age(whois: dict) -> tuple[int, list[str]]:
         signals.append(f'domain {age}d old')
     elif age < 365:
         pts = 3
-    # age >= 365 → established domain, no points
+    # age >= 365 → established domain, no age points
 
-    return min(pts, 25), signals
+    # ── Days to expiry — short registration = throwaway domain ───────────────
+    dte = whois.get('days_to_expiry')
+    if dte is not None:
+        if dte < 0:
+            pts += 10
+            signals.append('domain already expired (zombie/takeover risk)')
+        elif dte < 60:
+            pts += 12
+            signals.append(f'expires in {dte}d (throwaway registration)')
+        elif dte < 180:
+            pts += 8
+            signals.append(f'expires in {dte}d (short registration)')
+        elif dte < 365:
+            pts += 5
+            signals.append(f'expires in {dte}d (1-year registration)')
+    else:
+        # Expiry date hidden/unavailable alongside known age → extra suspicion
+        pts += 3
+        signals.append('expiry date hidden from WHOIS')
+
+    # ── Registrant privacy service — real owner concealed ────────────────────
+    if whois.get('registrant_is_private'):
+        pts += 5
+        signals.append('WHOIS registrant hidden behind privacy service')
+
+    # ── Registrant country risk ───────────────────────────────────────────────
+    HIGH_RISK_COUNTRIES = {
+        'RU', 'CN', 'NG', 'UA', 'KZ', 'TR', 'KP', 'IR', 'VN', 'ID',
+        'BR', 'PK', 'BD', 'GH', 'EG', 'MA',
+    }
+    country = whois.get('registrant_country', '') or ''
+    if country.upper() in HIGH_RISK_COUNTRIES:
+        pts += 4
+        signals.append(f'registrant country: {country} (high-abuse region)')
+
+    return min(pts, 40), signals
 
 
 def _score_visual_similarity(domain: str, original: str) -> tuple[int, list[str]]:
@@ -165,21 +206,21 @@ def _score_visual_similarity(domain: str, original: str) -> tuple[int, list[str]
         pts = 20
         signals.append('exact SLD match (IDN or clone)')
     elif dist == 1:
-        pts = 18
-        signals.append(f'1-char SLD difference (very close lookalike)')
+        pts = 22   # boosted: 1-edit lookalikes are the highest-risk visual class
+        signals.append('1-char SLD difference (very close lookalike)')
     elif dist == 2:
-        pts = 14
-        signals.append(f'2-char SLD difference (close lookalike)')
+        pts = 16   # boosted slightly
+        signals.append('2-char SLD difference (close lookalike)')
     elif dist == 3:
         pts = 10
-        signals.append(f'3-char SLD difference (lookalike)')
+        signals.append('3-char SLD difference (lookalike)')
     elif dist == 4:
         pts = 6
-        signals.append(f'4-char SLD difference')
+        signals.append('4-char SLD difference')
     elif dist <= 6:
         pts = 3
 
-    return min(pts, 20), signals
+    return min(pts, 22), signals
 
 
 def _score_domain_structure(domain: str) -> tuple[int, list[str]]:
@@ -191,11 +232,18 @@ def _score_domain_structure(domain: str) -> tuple[int, list[str]]:
     signals = []
 
     PHISHING_KEYWORDS = {
-        'login', 'secure', 'account', 'verify', 'bank', 'paypal', 'update',
-        'signin', 'password', 'wallet', 'crypto', 'support', 'service',
-        'alert', 'confirm', 'billing', 'auth', 'access', 'recovery',
-        'help', 'official', 'ebay', 'amazon', 'apple', 'microsoft',
-        'google', 'netflix', 'instagram', 'facebook', 'whatsapp',
+        # Actions / security terms
+        'login', 'secure', 'account', 'verify', 'update', 'signin', 'signout',
+        'password', 'auth', 'access', 'recovery', 'confirm', 'billing', 'alert',
+        'support', 'service', 'help', 'official', 'wallet', 'crypto', 'bank',
+        # Financial brands
+        'paypal', 'ebay', 'amazon', 'chase', 'wellsfargo', 'barclays', 'hsbc',
+        'citibank', 'visa', 'mastercard', 'amex', 'stripe', 'coinbase', 'binance',
+        # Tech / social brands
+        'google', 'gmail', 'youtube', 'microsoft', 'outlook', 'office365',
+        'apple', 'icloud', 'netflix', 'instagram', 'facebook', 'whatsapp',
+        'twitter', 'tiktok', 'snapchat', 'linkedin', 'discord', 'twitch',
+        'dropbox', 'github', 'gitlab', 'spotify', 'steam', 'roblox',
     }
 
     SUSPICIOUS_TLDS = {
@@ -241,6 +289,12 @@ def _score_domain_structure(domain: str) -> tuple[int, list[str]]:
     return min(pts, 15), signals
 
 
+def _active_page(web: dict) -> dict:
+    """Return the best available page data — HTTPS preferred, fall back to HTTP."""
+    https = web.get('https', {})
+    return https if not https.get('error') else web.get('http', {})
+
+
 def _score_page_content(web: dict) -> tuple[int, list[str]]:
     """
     Page content phishing signals extracted during enrichment.
@@ -250,7 +304,7 @@ def _score_page_content(web: dict) -> tuple[int, list[str]]:
     signals = []
 
     # Use HTTPS data preferentially, fall back to HTTP
-    page = web.get('https', {}) if not web.get('https', {}).get('error') else web.get('http', {})
+    page = _active_page(web)
 
     if not page or page.get('error'):
         return 0, []   # page unreachable — no content signal
@@ -317,7 +371,22 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
     content_pts,  content_sigs  = _score_page_content(web)
     ssl_pts,      ssl_sigs      = _score_ssl(ssl)
 
-    rule_raw = vt_pts + age_pts + sim_pts + struct_pts + content_pts + ssl_pts
+    rule_raw_base = vt_pts + age_pts + sim_pts + struct_pts + content_pts + ssl_pts
+
+    # ── Multi-signal combination bonus ────────────────────────────────────────
+    # Stacked independent signals (from different dimensions) are much stronger
+    # evidence of intent than any single signal alone.
+    # Each dimension fired beyond 2 adds +8 pts to rule_raw.
+    _dte = whois.get('days_to_expiry')
+    _combo_signals = sum([
+        int(sim_pts    >= 18),                                         # close lookalike
+        int(ssl_pts    >  0),                                          # missing SSL
+        int(age_pts    >= 5 or (_dte is not None and _dte < 365)),     # short/hidden registration
+        int(struct_pts >= 8),                                          # phishing keyword/pattern
+        int(content_pts > 0),                                          # active phishing content
+    ])
+    _combo_bonus = (_combo_signals - 2) * 8 if _combo_signals >= 3 else 0
+    rule_raw = min(rule_raw_base + _combo_bonus, 100)
 
     # ── XGBoost ML signal ─────────────────────────────────────────────────────
     ml_result = ml_score(domain_data, original)
@@ -327,11 +396,8 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
 
     # ── Hybrid fusion ─────────────────────────────────────────────────────────
     if ml_avail:
-        # Weighted combination: ML covers structure/WHOIS/SSL/DNS;
-        # rules cover VT + content + visual similarity
         fused = 0.55 * ml_raw + 0.45 * rule_raw
     else:
-        # Fallback: pure rule-based scoring (original behaviour)
         fused = float(rule_raw)
 
     score = min(int(round(fused)), 100)
@@ -339,24 +405,31 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
     # ── VT confirmed = hard override regardless of ML output ──────────────────
     vt_confirmed = vt.get('available', False) and vt.get('malicious', 0) >= 3
     if vt_confirmed:
-        score = max(score, 75)   # ensure classification is at least Malicious
+        score = max(score, 75)
 
-    # ── Risk classification ─────────────────────────────────────────────────────
-    # Fixed 3-tier model:
-    #   🟢 Safe       score <  28  → registered lookalike, no active threat signals.
-    #                               Monitor passively.
-    #   🟠 Suspicious score 28–74  → phishing indicators present, not yet confirmed.
-    #                               Investigate manually.
-    #   🔴 Malicious  score >= 75  → active phishing or confirmed by threat intel.
-    #   or VT confirmed              Block immediately.
+    # ── Risk classification ───────────────────────────────────────────────────
+    # When VT is available:   Safe<28,  Suspicious 28–74, Malicious≥75
+    # When VT is unavailable: Safe<22,  Suspicious 22–51, Malicious≥52
+    #
+    # Without VT the math max score is ~71. Thresholds scale proportionally.
+    # Malicious at 52 requires stacking ≥3 signals simultaneously:
+    #   e.g. fresh domain (<7d) + dist=1 + no SSL + brand/password in page
+    # Single-signal domains (visual similarity only) stay Suspicious at 22–40.
     vt_missing = not vt.get('available', False)
 
-    if score >= 75 or vt_confirmed:
+    if vt_missing:
+        t_malicious  = 52   # needs multiple strong signals stacked
+        t_suspicious = 22   # catches any dist=1 lookalike with secondary signal
+    else:
+        t_malicious  = 75
+        t_suspicious = 28
+
+    if score >= t_malicious or vt_confirmed:
         status     = 'Malicious'
         emoji      = '🔴'
         action     = 'Block immediately'
         confidence = 0.95 if vt_confirmed else (round(ml_prob, 2) if ml_avail else 0.88)
-    elif score >= 28:
+    elif score >= t_suspicious:
         status     = 'Suspicious'
         emoji      = '🟠'
         action     = 'Investigate manually'
@@ -367,27 +440,37 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
         action     = 'Monitor passively'
         confidence = round(1 - ml_prob, 2) if ml_avail else 0.92
 
-    # ── Proximity override ────────────────────────────────────────────────────
-    # New phishing domains at dist==1 ALREADY cross the 28-pt Suspicious
-    # threshold naturally (age_pts 15-25 + sim_pts 18 + ssl_pts 5 > 28).
-    # Old established domains (goole.com: 9648 days, googlee.com: 9499 days)
-    # should stay Safe — they are parked, not actively attacking anyone.
+    # ── Rule-based score floors (VT-blind protection) ─────────────────────────
+    # The ML model was trained on generic URL features (UCI dataset). It cannot
+    # detect brand-similarity intent — it classifies old established domains as
+    # "safe" because they have legitimate-looking signals (old, valid SSL, long
+    # expiry). When VT is unavailable, rule evidence must act as a safety net.
     #
-    # The only narrow case warranting an override: dist==1 domain where WHOIS
-    # age is completely unavailable (None) — hidden registration hiding age is
-    # itself a risk signal when combined with a near-identical name.
-    lev_dist = lev_distance(get_sld(domain), get_sld(original))
-    age_days_val = whois.get('age_days')
-    proximity_override = (
-        vt_missing and status == 'Safe' and
-        lev_dist == 1 and
-        age_days_val is None       # WHOIS age unknown → treat opaque domain as suspicious
-    )
-    if proximity_override:
-        status     = 'Suspicious'
-        emoji      = '🟠'
-        action     = 'Investigate manually'
-        confidence = round(ml_prob, 2) if ml_avail else 0.65
+    # Floor 1 — Suspicious (dist=1 + secondary evidence):
+    #   If a close lookalike has ≥8 pts from non-visual signals (keyword,
+    #   structure, registration, SSL), it cannot be rated Safe by ML alone.
+    #
+    # Floor 2 — Malicious (3+ independent dimensions + rule crosses threshold):
+    #   When separate evidence from 3+ dimensions (visual, registration/expiry,
+    #   SSL, structure, content) fires simultaneously AND rule_raw already
+    #   clears the Malicious threshold, enforce that classification regardless
+    #   of what ML says about the domain's structural legitimacy.
+    if vt_missing and ml_avail:
+        _rule_beyond_visual = rule_raw_base - sim_pts   # pts from signals other than sim
+        # Floor 1 — at least Suspicious
+        if (sim_pts >= 22 and _rule_beyond_visual >= 8 and status == 'Safe'):
+            score  = t_suspicious
+            status = 'Suspicious'
+            emoji  = '🟠'
+            action = 'Investigate manually'
+            confidence = round(ml_prob, 2)
+        # Floor 2 — at least Malicious
+        if (_combo_signals >= 3 and rule_raw >= t_malicious and score < t_malicious):
+            score  = t_malicious
+            status = 'Malicious'
+            emoji  = '🔴'
+            action = 'Block immediately'
+            confidence = round(ml_prob, 2)
 
 
     # ── Build explanation ─────────────────────────────────────────────────────
@@ -409,11 +492,7 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
         f"Score {score}/100 [{score_breakdown}] — "
         + (', '.join(all_signals) if all_signals else 'no strong signals detected')
     )
-    if proximity_override:
-        explanation += (
-            f' ⚠️ Proximity flag: {lev_dist}-char lookalike — '
-            'verify manually (no VT data available)'
-        )
+
 
     # ── Features dict (kept for DB/modal compatibility) ───────────────────────
     age_raw = whois.get('age_days')
@@ -440,11 +519,11 @@ def analyze_risk(domain_data: dict, original: str) -> dict:
         'vt_suspicious':     vt.get('suspicious', 0),
         'vt_available':      vt.get('available', False),
         'vt_community_neg':  int(vt.get('community_score', 0) < -5),
-        # Content signals
-        'has_password_form':        web.get('https', {}).get('has_password_form', False),
-        'has_external_form_action': web.get('https', {}).get('has_external_form_action', False),
-        'brand_in_page':            web.get('https', {}).get('brand_in_page', False),
-        'has_login_form':           web.get('https', {}).get('has_login_form', False),
+        # Content signals — use same HTTPS→HTTP fallback as _score_page_content
+        'has_password_form':        _active_page(web).get('has_password_form',        False),
+        'has_external_form_action': _active_page(web).get('has_external_form_action', False),
+        'brand_in_page':            _active_page(web).get('brand_in_page',            False),
+        'has_login_form':           _active_page(web).get('has_login_form',           False),
         # Score breakdown
         'score_vt':      vt_pts,
         'score_age':     age_pts,

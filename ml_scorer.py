@@ -78,7 +78,12 @@ def _is_ip(domain: str) -> int:
 
 
 def _days_to_expiry(whois: dict) -> float:
-    """Days remaining until domain expiry. -1 (missing in dataset) if unknown."""
+    """Days remaining until domain expiry. -1 if unknown."""
+    # Use pre-computed value stored by enricher (fast path)
+    dte = whois.get('days_to_expiry')
+    if dte is not None:
+        return max(float(dte), 0)
+    # Fall back: compute from expiration_date ISO string (legacy data)
     try:
         exp_str = whois.get('expiration_date')
         if not exp_str:
@@ -87,6 +92,7 @@ def _days_to_expiry(whois: dict) -> float:
         return max((exp - datetime.utcnow()).days, 0)
     except Exception:
         return -1
+
 
 
 def _age_days(whois: dict) -> float:

@@ -38,3 +38,6 @@ class User(db.Model, UserMixin):
     is_admin = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    # Email alert preferences
+    alert_email = db.Column(db.String(255), nullable=True)          # recipient address (None = disabled)
+    alert_malicious_only = db.Column(db.Boolean, default=False)     # True = send only when Malicious found

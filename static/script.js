@@ -608,21 +608,79 @@ function populateDomainModal(data) {
         vtHeaderBadge.classList.remove('hidden');
     }
 
-    // Explanation
-    const expl = document.getElementById('modal-explanation');
-    if (data.explanation) {
-        expl.textContent = '💡 ' + data.explanation;
-        expl.classList.remove('hidden');
-    }
 
-    // Score bar
-    const score = data.risk_score || 0;
-    const barEl  = document.getElementById('modal-score-bar');
-    const valEl  = document.getElementById('modal-score-val');
+
+    // Score bar — use adaptive thresholds (52/22 when no VT, 75/28 with VT)
+    const score    = data.risk_score || 0;
+    const vtAvail  = (data.virustotal || {}).available;
+    const tMal     = vtAvail ? 75 : 52;
+    const tSus     = vtAvail ? 28 : 22;
+    const barEl    = document.getElementById('modal-score-bar');
+    const valEl    = document.getElementById('modal-score-val');
+    // Update gauge labels
+    const elSus = document.getElementById('modal-thresh-sus');
+    const elMal = document.getElementById('modal-thresh-mal');
+    if (elSus) elSus.textContent = `${tSus} — Suspicious`;
+    if (elMal) elMal.textContent = `${tMal}–100 — Malicious`;
+
     valEl.textContent = score;
-    valEl.className = `font-bold text-2xl ${score >= 75 ? 'text-red-400' : score >= 28 ? 'text-amber-400' : 'text-emerald-400'}`;
-    barEl.className  = `h-full rounded-full transition-all duration-700 ${score >= 75 ? 'bg-red-500' : score >= 28 ? 'bg-amber-500' : 'bg-emerald-500'}`;
+    valEl.className = `font-bold text-2xl ${score >= tMal ? 'text-red-400' : score >= tSus ? 'text-amber-400' : 'text-emerald-400'}`;
+    barEl.className  = `h-full rounded-full transition-all duration-700 ${score >= tMal ? 'bg-red-500' : score >= tSus ? 'bg-amber-500' : 'bg-emerald-500'}`;
     setTimeout(() => { barEl.style.width = score + '%'; }, 50);
+
+    // Per-signal breakdown bars
+    const breakdownEl = document.getElementById('modal-score-breakdown');
+    if (breakdownEl) {
+        const bd = data.score_breakdown || {};
+        const ORDER = ['ml','vt','age','sim','struct','content','ssl'];
+        const ICONS = {
+            ml:      {icon: 'fa-robot',        color: 'blue'},
+            vt:      {icon: 'fa-shield-virus',  color: 'purple'},
+            age:     {icon: 'fa-calendar-alt',  color: 'yellow'},
+            sim:     {icon: 'fa-eye',           color: 'orange'},
+            struct:  {icon: 'fa-code',          color: 'cyan'},
+            content: {icon: 'fa-file-alt',      color: 'pink'},
+            ssl:     {icon: 'fa-lock',          color: 'teal'},
+        };
+        if (Object.keys(bd).length === 0) {
+            breakdownEl.innerHTML = '<p class="text-xs text-gray-500">Breakdown not available</p>';
+        } else {
+            breakdownEl.innerHTML = ORDER.map(key => {
+                const sig  = bd[key] || {pts: 0, max: 0, label: key};
+                const pct  = sig.max > 0 ? Math.round((sig.pts / sig.max) * 100) : 0;
+                const info  = ICONS[key] || {icon:'fa-circle', color:'gray'};
+                const barColor = sig.pts === 0 ? 'bg-gray-600'
+                               : sig.pts >= sig.max * 0.75 ? 'bg-red-500'
+                               : sig.pts >= sig.max * 0.4  ? 'bg-amber-500'
+                               :                             'bg-emerald-500';
+                const prob = (key === 'ml' && sig.prob != null)
+                    ? `<span class="text-gray-500 text-xs ml-1">(${(sig.prob * 100).toFixed(0)}% phish)</span>` : '';
+                return `
+                <div class="flex items-center gap-3 group">
+                    <div class="w-5 text-center flex-shrink-0">
+                        <i class="fas ${info.icon} text-${info.color}-400 text-xs opacity-70 group-hover:opacity-100"></i>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="flex justify-between items-center mb-0.5">
+                            <span class="text-xs text-gray-300">${esc(sig.label)}${prob}</span>
+                            <span class="text-xs font-mono ${ sig.pts > 0 ? (sig.pts >= sig.max * 0.75 ? 'text-red-400' : 'text-amber-400') : 'text-gray-500' }">
+                                ${sig.pts}/${sig.max}
+                            </span>
+                        </div>
+                        <div class="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                            <div class="h-full ${barColor} rounded-full transition-all duration-700" style="width:0%" data-pct="${pct}"></div>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+            // Animate bars after paint
+            setTimeout(() => {
+                breakdownEl.querySelectorAll('[data-pct]').forEach(el => {
+                    el.style.width = el.dataset.pct + '%';
+                });
+            }, 80);
+        }
+    }
 
     // VirusTotal section
     const vtSection = document.getElementById('modal-vt-section');
@@ -1065,6 +1123,131 @@ function navigateTo(page) {
 function refreshSessions() { fetchSessions(); }
 function showSessionInfo() { if (currentSessionId) showToast(`📋 Session: ${currentSessionId}`); }
 
+// ── Alert Settings Modal ──────────────────────────────────────────────────────
+
+async function openAlertModal() {
+    // Show modal
+    document.getElementById('alert-modal-overlay').classList.remove('hidden');
+    document.getElementById('alert-modal-box').classList.remove('hidden');
+
+    // Load current settings from server
+    try {
+        const res  = await fetch('/api/alert-settings');
+        const data = await res.json();
+
+        document.getElementById('alert-email-input').value = data.alert_email || '';
+        document.getElementById('alert-malicious-only-toggle').checked = !!data.alert_malicious_only;
+
+        // SMTP status banner
+        const banner = document.getElementById('smtp-status-banner');
+        if (data.smtp_configured) {
+            banner.className = 'mx-8 mt-6 px-4 py-3 rounded-2xl text-xs font-medium bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 flex items-center gap-2';
+            banner.innerHTML = `<i class="fas fa-check-circle"></i> SMTP connected via <strong>${data.smtp_server}</strong> — ready to send alerts`;
+            banner.classList.remove('hidden');
+        } else {
+            banner.className = 'mx-8 mt-6 px-4 py-3 rounded-2xl text-xs font-medium bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center gap-2';
+            banner.innerHTML = `<i class="fas fa-exclamation-triangle"></i> SMTP not configured. Add <code class="bg-gray-800 px-1 rounded">MAIL_SERVER</code>, <code class="bg-gray-800 px-1 rounded">MAIL_USERNAME</code> and <code class="bg-gray-800 px-1 rounded">MAIL_PASSWORD</code> to your <strong>.env</strong> file.`;
+            banner.classList.remove('hidden');
+        }
+
+        // Update bell dot indicator
+        const dot = document.getElementById('alert-bell-dot');
+        if (dot) dot.classList.toggle('hidden', !data.alert_email);
+    } catch (e) {
+        showToast('Failed to load alert settings', 'error');
+    }
+}
+
+function closeAlertModal() {
+    document.getElementById('alert-modal-overlay').classList.add('hidden');
+    document.getElementById('alert-modal-box').classList.add('hidden');
+}
+
+async function saveAlertSettings() {
+    const btn = document.getElementById('alert-save-btn');
+    const email = document.getElementById('alert-email-input').value.trim();
+    const maliciousOnly = document.getElementById('alert-malicious-only-toggle').checked;
+
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin text-xs"></i> Saving…';
+
+    try {
+        const res = await fetch('/api/alert-settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ alert_email: email, alert_malicious_only: maliciousOnly })
+        });
+        const data = await res.json();
+        if (data.error) {
+            showToast('❌ ' + data.error, 'error');
+        } else {
+            closeAlertModal();
+            showToast(
+                email
+                    ? `🔔 Alerts enabled → ${email}${maliciousOnly ? ' (Malicious only)' : ''}`
+                    : '🔕 Email alerts disabled',
+                'success'
+            );
+            // Update bell dot
+            const dot = document.getElementById('alert-bell-dot');
+            if (dot) dot.classList.toggle('hidden', !email);
+        }
+    } catch (e) {
+        showToast('❌ Save failed: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-save text-xs"></i> Save Settings';
+    }
+}
+
+async function sendTestEmail() {
+    const testInput = document.getElementById('alert-test-email-input');
+    const mainInput = document.getElementById('alert-email-input');
+    const toEmail   = (testInput.value.trim()) || (mainInput.value.trim());
+    const btn = document.getElementById('test-email-btn');
+
+    if (!toEmail) {
+        showToast('⚠️ Enter an email address first', 'warn');
+        return;
+    }
+    // Basic RFC 5321 format check before hitting Gmail
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail);
+    if (!emailOk) {
+        showToast(`❌ "${toEmail}" is not a valid email address`, 'error');
+        testInput.focus();
+        return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin text-xs"></i> Sending…';
+
+    try {
+        const res = await fetch('/api/test-email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to_email: toEmail })
+        });
+        const data = await res.json();
+        if (data.error) {
+            showToast('❌ ' + data.error, 'error');
+        } else {
+            showToast(`✅ Test email sent to ${toEmail}`, 'success');
+        }
+    } catch (e) {
+        showToast('❌ Test failed: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-paper-plane text-xs"></i> Send Test';
+    }
+}
+
+// Close alert modal on Escape key
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        closeAlertModal();
+    }
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 window.onload = function () {
     if (typeof tailwind !== 'undefined') tailwind.config = { darkMode: 'class' };
@@ -1075,6 +1258,12 @@ window.onload = function () {
     initSocket();
     fetchSessions();
     loadGlobalDashboard();
+
+    // Load bell dot state on page load
+    fetch('/api/alert-settings').then(r => r.json()).then(data => {
+        const dot = document.getElementById('alert-bell-dot');
+        if (dot && data.alert_email) dot.classList.remove('hidden');
+    }).catch(() => {});
 
     // Deep-link: /dashboard#<session-id>
     if (window.location.hash) {
