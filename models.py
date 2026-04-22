@@ -40,4 +40,17 @@ class User(db.Model, UserMixin):
     last_seen = db.Column(db.DateTime, default=datetime.utcnow)
     # Email alert preferences
     alert_email = db.Column(db.String(255), nullable=True)          # recipient address (None = disabled)
-    alert_malicious_only = db.Column(db.Boolean, default=False)     # True = send only when Malicious found
+    alert_malicious_only = db.Column(db.Boolean, default=False)     # True = only Malicious (not Suspicious)
+    alert_on_find = db.Column(db.Boolean, default=True)             # True = instant email when threat found during scan
+    alert_on_complete = db.Column(db.Boolean, default=True)         # True = digest email when scan finishes
+
+class ScheduledScan(db.Model):
+    """Persists a recurring monitoring schedule for a domain."""
+    id           = db.Column(db.Integer, primary_key=True)
+    user_id      = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    domain       = db.Column(db.String(255), nullable=False)
+    interval_hrs = db.Column(db.Integer, default=24)   # 1 | 6 | 24 | 168
+    enabled      = db.Column(db.Boolean, default=True)
+    last_run_at  = db.Column(db.DateTime, nullable=True)
+    next_run_at  = db.Column(db.DateTime, nullable=True)
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow)

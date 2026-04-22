@@ -17,12 +17,12 @@ import io
 import json
 import traceback
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from enricher import enrich_domain
 from risk_analyzer import analyze_risk, get_sld
 from Levenshtein import distance as lev_distance
-from models import db, ScanSession, DetectedDomain, Alert
+from models import db, ScanSession, DetectedDomain, Alert, ScheduledScan
 from mailer import send_threat_alert, send_test_email as mailer_send_test
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -94,6 +94,8 @@ with app.app_context():
     for col_def in [
         "ALTER TABLE user ADD COLUMN alert_email VARCHAR(255)",
         "ALTER TABLE user ADD COLUMN alert_malicious_only BOOLEAN DEFAULT 0",
+        "ALTER TABLE user ADD COLUMN alert_on_find BOOLEAN DEFAULT 1",
+        "ALTER TABLE user ADD COLUMN alert_on_complete BOOLEAN DEFAULT 1",
     ]:
         try:
             db.session.execute(db.text(col_def))
@@ -168,6 +170,8 @@ class ScanState:
         self.dns_total   = 0                  # total DNS permutations to resolve
         self.dns_done    = 0                  # how many have been resolved so far
         self.enrich_total = 0                 # total domains to enrich
+        self.first_alert_sent = False         # True once the instant "during scan" email has fired
+        self.threats_found_count = 0          # running count of Malicious/Suspicious domains detected
 
 active_scans: dict[str, ScanState] = {}      # session_id → ScanState
 
@@ -381,6 +385,7 @@ def _do_scan(session_id: str, domain: str,
                         print(f"[!] Error emitting real-time scan update: {e}")
 
                     if risk['risk_score'] >= 45:
+                        state.threats_found_count += 1
                         alert = Alert(
                             session_id=session_id,
                             domain=item_dict['domain'],
@@ -395,6 +400,9 @@ def _do_scan(session_id: str, domain: str,
                             'score': risk['risk_score'],
                             'session_id': session_id
                         })
+                        # ⚡ Fire instant alert for every Malicious domain found
+                        if risk['risk_status'] == 'Malicious':
+                            _send_instant_threat_alert(session_id, item_dict['domain'], risk)
 
                     if enriched_count % 10 == 0:
                         msg = f"Enriched {enriched_count}/{cap} domains..."
@@ -421,7 +429,7 @@ def _do_scan(session_id: str, domain: str,
         msg = f"SCAN COMPLETE — {enriched_count} active threats successfully extracted and vaulted."
         print(f"🎯 [{session_id[:8]}] " + msg)
         emit_scan_log(session_id, msg, 'success')
-        # Trigger email alert (non-blocking, runs in daemon thread)
+        # Trigger completion digest email (non-blocking, runs in daemon thread)
         _send_completion_email(session_id, domain, enriched_count)
 
 
@@ -438,37 +446,54 @@ def _set_db_status(session_id, status, count=None):
         print(f"DB update error: {e}")
 
 
-def _send_completion_email(session_id: str, domain: str, threat_count: int) -> None:
+def _get_smtp_cfg() -> dict:
+    """Read SMTP settings from Flask config, normalising None → empty string."""
+    return {
+        'server':     app.config.get('MAIL_SERVER')     or '',
+        'port':       app.config.get('MAIL_PORT')       or 587,
+        'username':   app.config.get('MAIL_USERNAME')   or '',
+        'password':   app.config.get('MAIL_PASSWORD')   or '',
+        'from_email': app.config.get('ALERT_FROM_EMAIL') or '',
+        'use_tls':    True,
+    }
+
+
+def _get_scan_user(session_id: str):
+    """Return the User for a session (falls back to first admin for legacy sessions)."""
+    from models import User
+    session_obj = db.session.get(ScanSession, session_id)
+    if not session_obj:
+        return None
+    if session_obj.user_id:
+        return db.session.get(User, session_obj.user_id)
+    return User.query.filter_by(is_admin=True).first()
+
+
+def _send_instant_threat_alert(session_id: str, threat_domain: str, risk: dict) -> None:
     """
-    Fire-and-forget email alert when a scan finishes.
-    Skips silently if user has no alert_email configured or no threats found.
-    Must be called from inside an app context (already true at scan end).
+    Fires an email during the scan when a threat is found,
+    including the full list of Malicious domains identified *so far*.
+    Skips silently if alert_on_find is disabled or no alert_email configured.
     """
     try:
-        from models import User
-        session_obj = db.session.get(ScanSession, session_id)
-        if not session_obj or not session_obj.user_id:
-            return
-        user = db.session.get(User, session_obj.user_id)
+        user = _get_scan_user(session_id)
         if not user or not user.alert_email:
-            return   # alerting not configured for this user
+            return
+        if not user.alert_on_find:
+            return
+        status = risk.get('risk_status', '')
+        if user.alert_malicious_only and status != 'Malicious':
+            return
 
-        # Fetch all threats for this session
+        session_obj = db.session.get(ScanSession, session_id)
+        session_domain = session_obj.domain if session_obj else 'unknown'
+
+        # Fetch all Malicious threats so far for this session
         threats_qs = DetectedDomain.query.filter(
             DetectedDomain.session_id == session_id,
-            DetectedDomain.risk_status.in_(['Malicious', 'Suspicious'])
-        ).order_by(DetectedDomain.risk_score.desc()).all()
-
-        if not threats_qs:
-            print(f"[mailer] No threats found for {session_id[:8]} — skipping email")
-            return
-
-        # If malicious_only, skip when there are no Malicious results
-        malicious_threats = [t for t in threats_qs if t.risk_status == 'Malicious']
-        if user.alert_malicious_only and not malicious_threats:
-            print(f"[mailer] No Malicious threats found for {session_id[:8]} (malicious_only=True) — skipping")
-            return
-
+            DetectedDomain.risk_status == 'Malicious'
+        ).order_by(DetectedDomain.timestamp.desc()).all()
+        
         threat_dicts = [{
             'domain':      t.domain,
             'risk_status': t.risk_status,
@@ -476,25 +501,72 @@ def _send_completion_email(session_id: str, domain: str, threat_count: int) -> N
             'enriched_data': t.enriched_data or {},
         } for t in threats_qs]
 
-        smtp_cfg = {
-            'server':     app.config.get('MAIL_SERVER', ''),
-            'port':       app.config.get('MAIL_PORT', 587),
-            'username':   app.config.get('MAIL_USERNAME', ''),
-            'password':   app.config.get('MAIL_PASSWORD', ''),
-            'from_email': app.config.get('ALERT_FROM_EMAIL', ''),
-            'use_tls':    app.config.get('MAIL_USE_TLS', True),
-        }
+        print(f"[⚡ mailer] Live alert: {threat_domain} [{status}] → {user.alert_email} (total Malicious: {len(threat_dicts)})")
+        from mailer import send_live_threat_alert
+        send_live_threat_alert(
+            to_email=user.alert_email,
+            session_domain=session_domain,
+            latest_threat_domain=threat_domain,
+            threats=threat_dicts,
+            smtp_config=_get_smtp_cfg(),
+        )
+    except Exception as exc:
+        print(f"[mailer] _send_instant_threat_alert error: {exc}")
 
-        print(f"[mailer] Firing alert for {domain} → {user.alert_email} ({len(threat_dicts)} threats)")
+
+
+def _send_completion_email(session_id: str, domain: str, threat_count: int) -> None:
+    """
+    Digest email when a scan finishes. Gated on user.alert_on_complete.
+    Skips silently if not configured or no threats found.
+    """
+    try:
+        from models import User
+        user = _get_scan_user(session_id)
+        if not user:
+            print(f"[mailer] No user for {session_id[:8]} — skipping completion email")
+            return
+        if not user.alert_email:
+            print(f"[mailer] User '{user.username}' has no alert_email — skipping (open 🔔 in dashboard)")
+            return
+        if not user.alert_on_complete:
+            print(f"[mailer] User '{user.username}' has alert_on_complete=False — skipping digest")
+            return
+
+        threats_qs = DetectedDomain.query.filter(
+            DetectedDomain.session_id == session_id,
+            DetectedDomain.risk_status.in_(['Malicious', 'Suspicious'])
+        ).order_by(DetectedDomain.risk_score.desc()).all()
+
+        if not threats_qs:
+            print(f"[mailer] No Malicious/Suspicious threats for {session_id[:8]} — skipping digest")
+            return
+
+        malicious_threats = [t for t in threats_qs if t.risk_status == 'Malicious']
+        if user.alert_malicious_only and not malicious_threats:
+            print(f"[mailer] malicious_only=True, no Malicious threats — skipping digest")
+            return
+
+        threat_dicts = [{
+            'domain':       t.domain,
+            'risk_status':  t.risk_status,
+            'risk_score':   t.risk_score,
+            'enriched_data': t.enriched_data or {},
+        } for t in threats_qs]
+
+        print(f"[mailer] 📧 Completion digest: {domain} → {user.alert_email} ({len(threat_dicts)} threats)")
         send_threat_alert(
             to_email=user.alert_email,
             session_domain=domain,
             threats=threat_dicts,
-            smtp_config=smtp_cfg,
+            smtp_config=_get_smtp_cfg(),
             malicious_only=bool(user.alert_malicious_only),
+            subject_prefix="📊 PhishGuard — Scan Complete",
         )
     except Exception as exc:
+        import traceback
         print(f"[mailer] _send_completion_email error: {exc}")
+        traceback.print_exc()
 
 
 # ─── Auth Routes ──────────────────────────────────────────────────────────────
@@ -647,10 +719,12 @@ def api_get_alert_settings():
     user = db.session.get(User, current_user.id)
     smtp_ok = bool(app.config.get('MAIL_SERVER') and app.config.get('MAIL_USERNAME'))
     return jsonify({
-        'alert_email':         user.alert_email or '',
+        'alert_email':          user.alert_email or '',
         'alert_malicious_only': bool(user.alert_malicious_only),
-        'smtp_configured':     smtp_ok,
-        'smtp_server':         app.config.get('MAIL_SERVER', '') or '',
+        'alert_on_find':        bool(user.alert_on_find)     if user.alert_on_find     is not None else True,
+        'alert_on_complete':    bool(user.alert_on_complete) if user.alert_on_complete is not None else True,
+        'smtp_configured':      smtp_ok,
+        'smtp_server':          app.config.get('MAIL_SERVER') or '',
     })
 
 @app.route('/api/alert-settings', methods=['POST'])
@@ -668,9 +742,16 @@ def api_save_alert_settings():
 
     user.alert_email = raw_email or None
     user.alert_malicious_only = bool(data.get('alert_malicious_only', False))
+    user.alert_on_find        = bool(data.get('alert_on_find',        True))
+    user.alert_on_complete    = bool(data.get('alert_on_complete',    True))
     db.session.commit()
-    return jsonify({'success': True, 'alert_email': user.alert_email or '',
-                    'alert_malicious_only': bool(user.alert_malicious_only)})
+    return jsonify({
+        'success':              True,
+        'alert_email':          user.alert_email or '',
+        'alert_malicious_only': bool(user.alert_malicious_only),
+        'alert_on_find':        bool(user.alert_on_find),
+        'alert_on_complete':    bool(user.alert_on_complete),
+    })
 
 @app.route('/api/test-email', methods=['POST'])
 @login_required
@@ -937,6 +1018,7 @@ def api_domain_detail(sid, domain_name):
         # DNS
         'dns_a':   ed.get('dns_a', []),
         'dns_mx':  ed.get('dns_mx', []),
+
         'dns_ns':  ed.get('dns_ns', []),
         'fuzzer':  ed.get('fuzzer', '—'),
         # Web
@@ -1002,6 +1084,76 @@ def _get_score_breakdown(ed, domain, original):
     except Exception:
         return {}
 
+@app.route('/api/scans/<sid>/domains/<path:domain_name>/notify-brand', methods=['POST'])
+def api_notify_brand(sid, domain_name):
+    """
+    Looks up the brand/original domain's security contacts via WHOIS,
+    then emails them to alert them that a phishing domain is impersonating them.
+    """
+    if not current_user.is_authenticated:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Load the phishing domain record
+    d = DetectedDomain.query.filter_by(session_id=sid, domain=domain_name).first()
+    if not d:
+        return jsonify({'error': 'Domain not found'}), 404
+
+    # Load the scan session to get the ORIGINAL brand domain (e.g. apple.com)
+    session = db.session.get(ScanSession, sid)
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+
+    brand_domain = session.domain  # e.g. 'apple.com'
+
+    # --- Look up WHOIS contact for the BRAND domain ---
+    import whois
+    brand_emails = []
+    try:
+        w = whois.whois(brand_domain)
+        raw_emails = getattr(w, 'emails', []) or []
+        if isinstance(raw_emails, str):
+            raw_emails = [raw_emails]
+        brand_emails = [e for e in raw_emails if '@' in str(e) and '.' in str(e)]
+    except Exception:
+        pass
+
+    # Fallback: well-known security contact patterns for the brand domain
+    if not brand_emails:
+        brand_parts = brand_domain.split('.')
+        base = f"{brand_parts[-2]}.{brand_parts[-1]}" if len(brand_parts) >= 2 else brand_domain
+        brand_emails = [
+            f"security@{base}",
+            f"abuse@{base}",
+        ]
+
+    brand_emails = list(set(brand_emails))
+
+    smtp_cfg = {
+        'server':     os.environ.get('MAIL_SERVER', ''),
+        'port':       int(os.environ.get('MAIL_PORT', 587)),
+        'username':   os.environ.get('MAIL_USERNAME', ''),
+        'password':   os.environ.get('MAIL_PASSWORD', ''),
+        'from_email': os.environ.get('MAIL_FROM', ''),
+        'use_tls':    os.environ.get('MAIL_USE_TLS', 'true').lower() == 'true',
+    }
+
+    from mailer import send_brand_notification
+    resp = send_brand_notification(
+        brand_domain=brand_domain,
+        phishing_domain=domain_name,
+        risk_score=d.risk_score,
+        risk_status=d.risk_status,
+        security_emails=brand_emails,
+        smtp_config=smtp_cfg
+    )
+
+    if resp.get('ok'):
+        return jsonify({'message': f'Brand alert sent to {", ".join(brand_emails)}'})
+    else:
+        return jsonify({'error': resp.get('error', 'Unknown error')}), 500
+
+
+
 @app.route('/api/scans/<sid>/status')
 def api_scan_status(sid):
     s = db.session.get(ScanSession, sid)
@@ -1066,6 +1218,24 @@ def api_json(sid):
     return Response(json.dumps(payload, indent=2, default=str), mimetype='application/json',
                     headers={'Content-Disposition': f'attachment; filename=phishguard_{sid[:8]}.json'})
 
+@app.route('/api/scans/<sid>/pdf')
+def api_pdf(sid):
+    try:
+        session = db.session.get(ScanSession, sid)
+        if not session:
+            return {'error': 'Session not found'}, 404
+            
+        results = DetectedDomain.query.filter_by(session_id=sid).all()
+        
+        from reporters import generate_scan_pdf
+        pdf_bytes = generate_scan_pdf(session.domain, results, sid)
+        
+        return Response(bytes(pdf_bytes), mimetype='application/pdf',
+                        headers={'Content-Disposition': f'attachment; filename=phishguard_{sid[:8]}.pdf'})
+    except Exception as e:
+        print(f"Error generating PDF: {e}")
+        return {'error': str(e)}, 500
+
 # ─── API: Dashboard ───────────────────────────────────────────────────────────
 
 @app.route('/api/dashboard')
@@ -1099,7 +1269,85 @@ def api_dashboard():
         ]
     })
 
+# ─── API: Scheduled Scans (Continuous Monitoring) ────────────────────────────
+
+@app.route('/api/scheduled-scans', methods=['GET'])
+@login_required
+def api_list_scheduled_scans():
+    schedules = ScheduledScan.query.filter_by(user_id=current_user.id).order_by(ScheduledScan.created_at.desc()).all()
+    return jsonify([{
+        'id':           s.id,
+        'domain':       s.domain,
+        'interval_hrs': s.interval_hrs,
+        'enabled':      s.enabled,
+        'last_run_at':  s.last_run_at.isoformat() if s.last_run_at else None,
+        'next_run_at':  s.next_run_at.isoformat() if s.next_run_at else None,
+        'created_at':   s.created_at.isoformat(),
+    } for s in schedules])
+
+@app.route('/api/scheduled-scans', methods=['POST'])
+@login_required
+def api_create_scheduled_scan():
+    data = request.get_json() or {}
+    domain = (data.get('domain') or '').strip().lower()
+    interval_hrs = int(data.get('interval_hrs', 24))
+
+    if not domain:
+        return jsonify({'error': 'domain is required'}), 400
+    if interval_hrs not in (1, 6, 24, 168):
+        return jsonify({'error': 'interval_hrs must be 1, 6, 24, or 168'}), 400
+
+    # Prevent duplicates for same user+domain
+    existing = ScheduledScan.query.filter_by(user_id=current_user.id, domain=domain).first()
+    if existing:
+        return jsonify({'error': f'A monitor for {domain} already exists'}), 409
+
+    now = datetime.utcnow()
+    sched = ScheduledScan(
+        user_id=current_user.id,
+        domain=domain,
+        interval_hrs=interval_hrs,
+        enabled=True,
+        next_run_at=now + timedelta(hours=interval_hrs),
+    )
+    db.session.add(sched)
+    db.session.commit()
+    return jsonify({'id': sched.id, 'domain': sched.domain,
+                    'interval_hrs': sched.interval_hrs, 'next_run_at': sched.next_run_at.isoformat()}), 201
+
+@app.route('/api/scheduled-scans/<int:sid>', methods=['PATCH'])
+@login_required
+def api_update_scheduled_scan(sid):
+    sched = ScheduledScan.query.filter_by(id=sid, user_id=current_user.id).first_or_404()
+    data = request.get_json() or {}
+    if 'enabled' in data:
+        sched.enabled = bool(data['enabled'])
+    if 'interval_hrs' in data and int(data['interval_hrs']) in (1, 6, 24, 168):
+        sched.interval_hrs = int(data['interval_hrs'])
+        sched.next_run_at = datetime.utcnow() + timedelta(hours=sched.interval_hrs)
+    db.session.commit()
+    return jsonify({'ok': True, 'enabled': sched.enabled, 'interval_hrs': sched.interval_hrs})
+
+@app.route('/api/scheduled-scans/<int:sid>', methods=['DELETE'])
+@login_required
+def api_delete_scheduled_scan(sid):
+    sched = ScheduledScan.query.filter_by(id=sid, user_id=current_user.id).first_or_404()
+    db.session.delete(sched)
+    db.session.commit()
+    return jsonify({'ok': True})
+
+@app.route('/api/scheduled-scans/<int:sid>/run-now', methods=['POST'])
+@login_required
+def api_run_scheduled_scan_now(sid):
+    """Immediately trigger a scheduled scan, ignoring next_run_at."""
+    sched = ScheduledScan.query.filter_by(id=sid, user_id=current_user.id).first_or_404()
+    from scheduler import _fire_scan
+    import threading
+    threading.Thread(target=_fire_scan, args=(sched,), daemon=True).start()
+    return jsonify({'ok': True, 'message': f'Scan triggered for {sched.domain}'})
+
 # ─── SocketIO ─────────────────────────────────────────────────────────────────
+
 
 @socketio.on('connect')
 def handle_connect():
@@ -1108,5 +1356,21 @@ def handle_connect():
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    # Init background scheduler after all models + app config are ready
+    from scheduler import init_scheduler, shutdown_scheduler
+    from models import User as _UserModel, ScheduledScan as _SchedModel
+    import atexit
+    init_scheduler(
+        app=app,
+        db=db,
+        do_scan_fn=_do_scan,
+        active_scans_dict=active_scans,
+        ScanSession=ScanSession,
+        DetectedDomain=DetectedDomain,
+        ScheduledScan=_SchedModel,
+        User=_UserModel,
+        ScanState=ScanState,
+    )
+    atexit.register(shutdown_scheduler)
     print("🚀 PhishGuard started → http://127.0.0.1:8000")
     socketio.run(app, host='127.0.0.1', port=8000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)

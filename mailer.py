@@ -216,6 +216,157 @@ def _build_text(domain: str, threats: List[Dict[str, Any]]) -> str:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+_LIVE_ALERT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhishGuard — Live Threat Update</title>
+</head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<div style="max-width:520px;margin:0 auto;padding:32px 16px;">
+
+  <!-- Header Bar -->
+  <div style="background:linear-gradient(135deg,#e11d48,#be123c);border-radius:16px;padding:28px 32px;margin-bottom:20px;text-align:center;">
+    <div style="display:inline-block;background:rgba(0,0,0,0.2);border-radius:10px;padding:6px 14px;font-size:11px;font-weight:700;color:#fecdd3;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:14px;">🚨 Live Scan Alert</div>
+    <h1 style="margin:0;font-size:22px;font-weight:800;color:#fff;">Malicious Threat Found</h1>
+    <p style="margin:8px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">Scanning <strong style="color:#fff;">{session_domain}</strong></p>
+  </div>
+
+  <!-- Latest Threat Card -->
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:24px 32px;margin-bottom:16px;">
+    <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:#cbd5e1;margin-bottom:12px;">Just Detected</div>
+    <div style="font-family:'Menlo','Consolas',monospace;font-size:18px;font-weight:700;color:#f87171;word-break:break-all;">{latest_threat_domain}</div>
+  </div>
+
+  <!-- Threat List -->
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:20px 32px;margin-bottom:20px;">
+    <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:#94a3b8;margin-bottom:12px;">All Malicious Found So Far ({threat_count})</div>
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+      {threat_list_html}
+    </table>
+  </div>
+
+  <!-- Info Box -->
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:18px 24px;margin-bottom:20px;">
+    <p style="margin:0;font-size:13px;color:#94a3b8;line-height:1.6;">
+      PhishGuard is actively scanning <strong style="color:#e2e8f0;">{session_domain}</strong> for phishing domains.<br><br>
+      <strong style="color:#e2e8f0;">A full threat digest</strong> will be sent automatically when the scan completes.
+    </p>
+  </div>
+
+  <!-- CTA -->
+  <div style="text-align:center;margin-bottom:24px;">
+    <a href="http://127.0.0.1:8000/dashboard"
+       style="display:inline-block;background:#e11d48;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:12px 28px;border-radius:12px;">
+      View Live Dashboard →
+    </a>
+  </div>
+
+  <!-- Footer -->
+  <p style="text-align:center;font-size:11px;color:#475569;margin:0;">
+    🛡️ PhishGuard Automated Threat Intelligence · Do not reply to this email
+  </p>
+
+</div>
+</body>
+</html>"""
+
+
+def send_live_threat_alert(
+    to_email: str,
+    session_domain: str,
+    latest_threat_domain: str,
+    threats: List[Dict[str, Any]],
+    smtp_config: Dict[str, Any],
+) -> None:
+    """
+    Fire a live 'during scan' email whenever a new malicious domain is found,
+    showing all malicious domains discovered so far.
+    Runs in a daemon background thread — never blocks the scan worker.
+    """
+    
+    threat_list_html = ""
+    for idx, t in enumerate(threats[:20]): # Caps at 20 to avoid massive emails during scans
+        domain = t.get('domain', '')
+        score = t.get('risk_score', 0)
+        # Highlight the newest one
+        bg_col = '#334155' if domain == latest_threat_domain else 'transparent'
+        
+        threat_list_html += f"""
+        <tr>
+            <td valign="middle" style="padding:10px 0;background-color:{bg_col};font-family:'Menlo','Consolas',monospace;font-size:13px;color:#e2e8f0;word-break:break-all;border-bottom:1px solid rgba(255,255,255,0.05);">
+                <span style="padding-left:12px;">{domain}</span>
+            </td>
+            <td align="right" valign="middle" style="padding:10px 0;background-color:{bg_col};font-size:13px;font-weight:700;color:#f87171;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;">
+                <span style="padding-right:12px;">{score}</span>
+            </td>
+        </tr>
+        """
+        
+    if len(threats) > 20:
+        threat_list_html += f"""
+        <tr>
+            <td colspan="2" align="center" style="padding-top:12px;font-size:12px;color:#64748b;">
+                + {len(threats) - 20} more... (see dashboard or final digest)
+            </td>
+        </tr>
+        """
+
+    html = _LIVE_ALERT_HTML.format(
+        session_domain=session_domain,
+        latest_threat_domain=latest_threat_domain,
+        threat_count=len(threats),
+        threat_list_html=threat_list_html,
+    )
+    
+    plain_list = "\n".join([f" - {t.get('domain')} (Score: {t.get('risk_score')})" for t in threats[:20]])
+    if len(threats) > 20:
+        plain_list += f"\n ... and {len(threats) - 20} more."
+
+    plain = (
+        f"PhishGuard — Live Threat Update\n"
+        f"Scanning: {session_domain}\n\n"
+        f"Just Detected: {latest_threat_domain}\n\n"
+        f"All Malicious Found So Far ({len(threats)}):\n"
+        f"{plain_list}\n\n"
+        f"A full threat digest will be emailed when the scan completes.\n"
+        f"Dashboard: http://127.0.0.1:8000/dashboard"
+    )
+
+    def _send():
+        server   = smtp_config.get('server', '')
+        port     = int(smtp_config.get('port', 587))
+        username = smtp_config.get('username', '')
+        password = smtp_config.get('password', '')
+        from_email = smtp_config.get('from_email') or username
+
+        if not (server and username and password):
+            logger.warning("[mailer] SMTP not configured — skipping live threat alert")
+            return
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"🚨 PhishGuard — New Malicious Threat: {latest_threat_domain}"
+        msg['From']    = from_email
+        msg['To']      = to_email
+
+        msg.attach(MIMEText(plain, 'plain', 'utf-8'))
+        msg.attach(MIMEText(html,  'html',  'utf-8'))
+
+        try:
+            with smtplib.SMTP(server, port, timeout=15) as s:
+                if smtp_config.get('use_tls', True):
+                    s.starttls()
+                s.login(username, password)
+                s.sendmail(from_email, [to_email], msg.as_bytes())
+            logger.info("[mailer] 🚨 Live threat alert sent → %s", to_email)
+        except Exception as e:
+            logger.error("[mailer] Live threat alert failed: %s", e)
+
+    threading.Thread(target=_send, daemon=True, name=f"live-alert-{session_domain}").start()
+
+
 def send_threat_alert(
     to_email: str,
     session_domain: str,
@@ -356,3 +507,121 @@ def send_test_email(to_email: str, smtp_config: Dict[str, Any]) -> dict:
     except Exception as e:
         return {'ok': False, 'error': str(e)}
 
+_BRAND_ALERT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<div style="max-width:560px;margin:32px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
+
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#dc2626,#b91c1c);padding:32px 36px;">
+    <div style="background:rgba(255,255,255,0.15);display:inline-block;border-radius:8px;padding:4px 12px;font-size:11px;font-weight:700;color:#fecaca;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:14px;">🚨 Brand Impersonation Alert</div>
+    <h1 style="margin:0;font-size:22px;font-weight:800;color:#ffffff;line-height:1.3;">Your Brand Is Being Impersonated</h1>
+    <p style="margin:10px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">
+      PhishGuard has detected an active phishing domain targeting <strong style="color:#fff;">{brand_domain}</strong>
+    </p>
+  </div>
+
+  <!-- Body -->
+  <div style="padding:32px 36px;">
+    <p style="margin:0 0 20px;color:#475569;font-size:14px;line-height:1.7;">
+      Dear <strong>{brand_domain}</strong> Security Team,
+    </p>
+    <p style="margin:0 0 20px;color:#475569;font-size:14px;line-height:1.7;">
+      Our automated Threat Intelligence Platform, <strong>PhishGuard</strong>, has identified the following domain actively impersonating your brand to harvest user credentials:
+    </p>
+
+    <!-- Threat Card -->
+    <div style="background:#fef2f2;border:1px solid #fecaca;border-left:4px solid #dc2626;border-radius:8px;padding:20px 24px;margin-bottom:24px;">
+      <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#991b1b;margin-bottom:8px;">Detected Phishing Domain</div>
+      <div style="font-family:'Menlo','Consolas',monospace;font-size:18px;font-weight:700;color:#dc2626;word-break:break-all;">{phishing_domain}</div>
+      <div style="margin-top:12px;display:flex;gap:16px;">
+        <div>
+          <div style="font-size:11px;color:#6b7280;margin-bottom:2px;">Risk Score</div>
+          <div style="font-size:16px;font-weight:700;color:#dc2626;">{risk_score}/100</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:#6b7280;margin-bottom:2px;">Classification</div>
+          <div style="font-size:16px;font-weight:700;color:#dc2626;">{risk_status}</div>
+        </div>
+      </div>
+    </div>
+
+    <p style="margin:0 0 16px;color:#475569;font-size:14px;line-height:1.7;">
+      This domain exhibits characteristics consistent with active phishing infrastructure — including structural similarities to your brand name, credential harvesting forms, and registration patterns associated with disposable phishing campaigns.
+    </p>
+    <p style="margin:0 0 16px;color:#475569;font-size:14px;line-height:1.7;">
+      We recommend your security team investigate and consider filing a takedown request with the domain registrar immediately to protect your users.
+    </p>
+
+    <p style="margin:0;color:#94a3b8;font-size:13px;">This is an automated alert sent by the <strong>PhishGuard Threat Intelligence Platform</strong>.</p>
+  </div>
+
+  <!-- Footer -->
+  <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 36px;text-align:center;">
+    <p style="margin:0;font-size:11px;color:#94a3b8;">PhishGuard SOC &bull; Automated Brand Protection Alert</p>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+
+def send_brand_notification(brand_domain: str, phishing_domain: str, risk_score: float,
+                            risk_status: str, security_emails: List[str], smtp_config: Dict[str, Any]) -> dict:
+    """
+    Notifies the real brand owner that a phishing domain is impersonating them.
+    Emails are sent to the brand domain's security/abuse contacts.
+    """
+    server     = smtp_config.get('server', '')
+    port       = int(smtp_config.get('port', 587))
+    username   = smtp_config.get('username', '')
+    password   = smtp_config.get('password', '')
+    from_email = smtp_config.get('from_email') or username
+    use_tls    = smtp_config.get('use_tls', True)
+
+    if not (server and username and password):
+        return {'ok': False, 'error': 'SMTP not configured in .env'}
+
+    if not security_emails:
+        return {'ok': False, 'error': 'No security contact email found for the brand domain'}
+
+    html = _BRAND_ALERT_HTML.format(
+        brand_domain=brand_domain,
+        phishing_domain=phishing_domain,
+        risk_score=risk_score,
+        risk_status=risk_status,
+    )
+
+    plain = (
+        f"Brand Impersonation Alert — {brand_domain}\n\n"
+        f"PhishGuard has detected an active phishing domain impersonating your brand:\n"
+        f"  Domain : {phishing_domain}\n"
+        f"  Score  : {risk_score}/100 ({risk_status})\n\n"
+        f"Please investigate and consider filing a takedown with the domain registrar.\n\n"
+        f"-- PhishGuard Threat Intelligence Platform"
+    )
+
+    to_address = ", ".join(security_emails)
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f'[PhishGuard Alert] Brand Impersonation Detected — {phishing_domain}'
+    msg['From']    = from_email
+    msg['To']      = to_address
+    msg['Reply-To'] = from_email
+
+    msg.attach(MIMEText(plain, 'plain'))
+    msg.attach(MIMEText(html, 'html'))
+
+    try:
+        with smtplib.SMTP(server, port, timeout=10) as smtp_conn:
+            if use_tls:
+                smtp_conn.starttls()
+            smtp_conn.login(username, password)
+            smtp_conn.sendmail(from_email, security_emails, msg.as_bytes())
+        logger.info("[mailer] Brand alert dispatched for %s → %s", phishing_domain, to_address)
+        return {'ok': True}
+    except Exception as e:
+        logger.error("[mailer] Brand alert failed: %s", e)
+        return {'ok': False, 'error': str(e)}

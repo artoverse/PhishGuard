@@ -54,6 +54,9 @@ def get_whois_info(domain):
                 getattr(w, 'registrant_country', '') or '').strip().upper()
         ) or None
 
+        emails = getattr(w, 'emails', [])
+        if isinstance(emails, str): emails = [emails]
+
         return {
             'registrar':            w.registrar,
             'creation_date':        creation.isoformat() if creation else None,
@@ -66,6 +69,7 @@ def get_whois_info(domain):
             'days_to_expiry':       days_to_expiry,
             'registrant_is_private': registrant_is_private,
             'registrant_country':   registrant_country,
+            'emails':               emails,
         }
     except Exception as e:
         return {'error': f'WHOIS failed: {str(e)}'}

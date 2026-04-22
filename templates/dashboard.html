@@ -221,10 +221,10 @@
                             <div class="text-xs text-gray-400 mt-1">Full enriched data</div>
                         </button>
                         <button onclick="downloadReport('pdf')"
-                            class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition opacity-50 cursor-not-allowed">
+                            class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition">
                             <i class="fas fa-file-pdf text-4xl mb-4 text-red-400"></i>
                             <div class="font-semibold">PDF Report</div>
-                            <div class="text-xs text-gray-400 mt-1">Coming soon</div>
+                            <div class="text-xs text-gray-400 mt-1">Formatted security report</div>
                         </button>
                         <button onclick="downloadReport('txt')"
                             class="bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-3xl p-8 text-center transition opacity-50 cursor-not-allowed">
@@ -233,7 +233,62 @@
                             <div class="text-xs text-gray-400 mt-1">Coming soon</div>
                         </button>
                     </div>
+
+                    <!-- ── Continuous Monitoring ── -->
+                    <div class="mt-10">
+                        <div class="flex items-center justify-between mb-5">
+                            <div>
+                                <h3 class="text-white font-semibold text-base flex items-center gap-2">
+                                    <i class="fas fa-satellite-dish text-blue-400"></i> Continuous Monitoring
+                                </h3>
+                                <p class="text-gray-500 text-xs mt-1">Automatically re-scan domains on a schedule. Only new threats trigger an alert.</p>
+                            </div>
+                        </div>
+
+                        <!-- Add Monitor Form -->
+                        <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5 mb-5 flex flex-wrap gap-3 items-end">
+                            <div class="flex-1 min-w-[160px]">
+                                <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Brand Domain</label>
+                                <input id="sched-domain-input" type="text" placeholder="e.g. apple.com"
+                                    class="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-blue-500 transition"/>
+                            </div>
+                            <div class="min-w-[140px]">
+                                <label class="text-xs text-gray-500 uppercase tracking-wider mb-1 block">Scan Interval</label>
+                                <select id="sched-interval-select"
+                                    class="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-xl px-4 py-2.5 focus:outline-none focus:border-blue-500 transition">
+                                    <option value="1">Every Hour</option>
+                                    <option value="6">Every 6 Hours</option>
+                                    <option value="24" selected>Daily</option>
+                                    <option value="168">Weekly</option>
+                                </select>
+                            </div>
+                            <button onclick="addScheduledScan()" id="sched-add-btn"
+                                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition flex items-center gap-2 whitespace-nowrap">
+                                <i class="fas fa-plus"></i> Add Monitor
+                            </button>
+                        </div>
+
+                        <!-- Monitors Table -->
+                        <div class="bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="text-gray-500 text-xs uppercase tracking-wider border-b border-gray-800">
+                                        <th class="px-6 py-4 text-left">Domain</th>
+                                        <th class="px-6 py-4 text-left">Interval</th>
+                                        <th class="px-6 py-4 text-left">Last Run</th>
+                                        <th class="px-6 py-4 text-left">Next Run</th>
+                                        <th class="px-6 py-4 text-center">Status</th>
+                                        <th class="px-6 py-4 text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="sched-table-body" class="divide-y divide-gray-800">
+                                    <tr><td colspan="6" class="px-6 py-10 text-center text-gray-600 text-xs italic">No monitors configured yet.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
+
 
                 <!-- ── Tab 4: Session Logs / Debug (isolated per session) ── -->
                 <div id="tab-4" class="tab-content hidden">
@@ -308,16 +363,53 @@
                 <p class="text-xs text-gray-500 mt-1.5">Leave blank to disable email alerts for your account.</p>
             </div>
 
-            <!-- Malicious-only Toggle -->
-            <div class="flex items-center justify-between">
-                <div>
-                    <div class="text-sm font-medium text-white">High-risk only</div>
-                    <div class="text-xs text-gray-500 mt-0.5">Only email when <span class="text-red-400 font-semibold">Malicious</span> domains are found</div>
+            <!-- When to alert section -->
+            <div>
+                <div class="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">When to Alert</div>
+                <div class="space-y-3">
+
+                    <!-- Alert during scan -->
+                    <div class="flex items-center justify-between bg-gray-800/50 border border-gray-700/50 rounded-2xl px-4 py-3">
+                        <div>
+                            <div class="text-sm font-medium text-white flex items-center gap-2">
+                                <i class="fas fa-bolt text-yellow-400 text-xs"></i> During scan
+                            </div>
+                            <div class="text-xs text-gray-500 mt-0.5">Live updates with the growing list of <span class="text-red-400 font-semibold">Malicious</span> domains</div>
+                        </div>
+                        <label class="toggle-switch flex-shrink-0">
+                            <input type="checkbox" id="alert-on-find-toggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <!-- Alert when scan completes -->
+                    <div class="flex items-center justify-between bg-gray-800/50 border border-gray-700/50 rounded-2xl px-4 py-3">
+                        <div>
+                            <div class="text-sm font-medium text-white flex items-center gap-2">
+                                <i class="fas fa-flag-checkered text-green-400 text-xs"></i> On completion
+                            </div>
+                            <div class="text-xs text-gray-500 mt-0.5">Full threat digest when scan finishes</div>
+                        </div>
+                        <label class="toggle-switch flex-shrink-0">
+                            <input type="checkbox" id="alert-on-complete-toggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <!-- High-risk only filter -->
+                    <div class="flex items-center justify-between bg-gray-800/50 border border-gray-700/50 rounded-2xl px-4 py-3">
+                        <div>
+                            <div class="text-sm font-medium text-white flex items-center gap-2">
+                                <i class="fas fa-skull-crossbones text-red-400 text-xs"></i> Malicious only
+                            </div>
+                            <div class="text-xs text-gray-500 mt-0.5">Skip <span class="text-yellow-400">Suspicious</span> — only alert on <span class="text-red-400 font-semibold">Malicious</span></div>
+                        </div>
+                        <label class="toggle-switch flex-shrink-0">
+                            <input type="checkbox" id="alert-malicious-only-toggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
                 </div>
-                <label class="toggle-switch flex-shrink-0">
-                    <input type="checkbox" id="alert-malicious-only-toggle">
-                    <span class="toggle-slider"></span>
-                </label>
             </div>
 
             <!-- Divider -->
@@ -341,6 +433,7 @@
                 </div>
             </div>
         </div>
+
 
         <!-- Footer: Save / Cancel -->
         <div class="flex gap-3 px-8 pb-8">
@@ -392,18 +485,26 @@
     <div class="flex items-start justify-between px-8 py-6 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
         <div class="min-w-0 flex-1 pr-4">
             <div id="modal-domain-name" class="text-xl font-bold font-mono text-white truncate">—</div>
-            <div class="flex items-center gap-2 mt-2">
+            <div class="flex items-center flex-wrap gap-2 mt-2">
                 <span id="modal-risk-badge" class="px-3 py-1 text-xs font-semibold rounded-full">—</span>
                 <span id="modal-score-text" class="text-gray-400 text-sm">—</span>
                 <span id="modal-action-badge" class="hidden px-3 py-1 text-xs font-medium rounded-full border"></span>
                 <span id="modal-vt-badge" class="hidden px-3 py-1 text-xs font-semibold rounded-full bg-red-500/20 text-red-400"></span>
             </div>
         </div>
-        <button onclick="closeDomainModal()" id="modal-close-btn"
-            class="text-gray-400 hover:text-white transition p-2 rounded-xl hover:bg-gray-700 flex-shrink-0">
-            <i class="fas fa-times text-lg"></i>
-        </button>
+        <div class="flex items-start gap-2 flex-shrink-0">
+            <button id="modal-takedown-btn" onclick="submitTakedown()"
+                style="display:none"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all whitespace-nowrap">
+                <i class="fas fa-bell mr-1"></i>Notify Brand Owner
+            </button>
+            <button onclick="closeDomainModal()" id="modal-close-btn"
+                class="text-gray-400 hover:text-white transition p-2 rounded-xl hover:bg-gray-700 flex-shrink-0">
+                <i class="fas fa-times text-lg"></i>
+            </button>
+        </div>
     </div>
+
 
 
     <!-- Modal Body -->

@@ -359,17 +359,54 @@ async function sessionReset(sid, e) {
     } catch (err) { showToast('Reset failed: ' + err.message); }
 }
 
-function sessionNewScan(domain, e) {
+async function sessionNewScan(domain, e) {
     e && e.stopPropagation();
-    // Navigate to scanner with domain pre-filled via query param
-    window.location.href = `/?domain=${encodeURIComponent(domain)}`;
+
+    // Find the button that was clicked and show a spinner
+    const btn = e && e.currentTarget;
+    const originalHTML = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin text-[10px]"></i>';
+    }
+
+    try {
+        const res = await fetch('/api/scans', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domain })
+        });
+        const data = await res.json();
+
+        if (data.error) {
+            showToast('❌ ' + data.error);
+            if (btn) { btn.disabled = false; btn.innerHTML = originalHTML; }
+            return;
+        }
+
+        showToast(`🚀 New scan started for ${domain}`);
+
+        // Refresh sessions list so the new session appears, then select it
+        await fetchSessions();
+        if (data.id) selectSession(data.id);
+
+    } catch (err) {
+        showToast('❌ Failed to start scan');
+        if (btn) { btn.disabled = false; btn.innerHTML = originalHTML; }
+    }
 }
 
 // ── Select a session → show its isolated phishing domain list ────────────────
+let _sessionLoadController = null;  // AbortController for cancelling in-flight requests
+
 async function selectSession(sid) {
+    // Cancel any in-flight session load
+    if (_sessionLoadController) _sessionLoadController.abort();
+    _sessionLoadController = new AbortController();
+
     currentSessionId = sid;
 
-    // Highlight selected card
+    // Highlight selected card immediately
     document.querySelectorAll('.session-item').forEach(el => {
         el.classList.remove('bg-blue-600', 'text-white');
         el.classList.add('text-gray-300', 'hover:bg-gray-800/60', 'bg-gray-800/30');
@@ -380,7 +417,20 @@ async function selectSession(sid) {
         card.classList.remove('text-gray-300', 'hover:bg-gray-800/60', 'bg-gray-800/30');
     }
 
-    const session = allSessions.find(s => s.id === sid);
+    // Clear the domain table immediately so stale data isn't visible
+    const tbody = document.getElementById('domains-body');
+    if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="px-8 py-16 text-center text-gray-500 animate-pulse">Loading session data…</td></tr>`;
+
+    // Find session from cache OR fetch fresh
+    let session = allSessions.find(s => s.id === sid);
+    if (!session) {
+        try {
+            const r = await fetch(`/api/scans/${sid}/status`, { signal: _sessionLoadController.signal });
+            const st = await r.json();
+            session = { id: sid, domain: st.domain || sid, status: st.status };
+        } catch (_) {}
+    }
+
     const badge = document.getElementById('current-session-badge');
     if (badge && session) {
         badge.textContent = `${session.domain} • ${sid.substring(0, 8)}`;
@@ -396,7 +446,7 @@ async function selectSession(sid) {
     // Update URL hash so the link is shareable
     history.replaceState(null, '', `/dashboard#${sid}`);
 
-    await loadSessionDomains(sid, true);
+    await loadSessionDomains(sid, false);
 }
 
 async function loadSessionDomains(sid, switchToDomainsTab = false) {
@@ -405,6 +455,10 @@ async function loadSessionDomains(sid, switchToDomainsTab = false) {
             fetch(`/api/scans/${sid}/domains`),
             fetch(`/api/scans/${sid}/status`)
         ]);
+
+        // If the user switched away while we were loading, discard this result
+        if (currentSessionId !== sid) return;
+
         const domains = await domainsRes.json();
         const status  = await statusRes.json();
 
@@ -425,10 +479,12 @@ async function loadSessionDomains(sid, switchToDomainsTab = false) {
 
         if (switchToDomainsTab) switchTab(domains.length > 0 ? 1 : 0);
     } catch (e) {
+        if (e.name === 'AbortError') return;  // intentionally cancelled
         console.error('loadSessionDomains error:', e);
         showToast('❌ Failed to load session data');
     }
 }
+
 
 // ── Scan progress bar shown inside main panel when selected ──────────────────
 function renderScanStatusBar(status) {
@@ -558,6 +614,15 @@ async function openDomainModal(domainName, sid) {
     document.getElementById('modal-dns').innerHTML = '<div class="text-gray-500 text-sm animate-pulse">Loading DNS…</div>';
     document.getElementById('modal-web').innerHTML = '<div class="text-gray-500 text-sm animate-pulse">Loading web…</div>';
 
+    // Reset takedown button state immediately
+    const takedownBtn = document.getElementById('modal-takedown-btn');
+    if (takedownBtn) {
+        takedownBtn.style.display = 'none';
+        takedownBtn.className = 'bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all whitespace-nowrap';
+        takedownBtn.innerHTML = '<i class="fas fa-bell mr-1"></i>Notify Brand Owner';
+        takedownBtn.disabled = false;
+    }
+
     try {
         const res  = await fetch(`/api/scans/${sid}/domains/${encodeURIComponent(domainName)}`);
         const data = await res.json();
@@ -588,6 +653,17 @@ function populateDomainModal(data) {
                                              'bg-emerald-500/20 text-emerald-400');
 
     document.getElementById('modal-score-text').textContent = `Score: ${data.risk_score}/100`;
+
+    // Takedown button visibility
+    const takedownBtn = document.getElementById('modal-takedown-btn');
+    if (takedownBtn) {
+        if (data.risk_status === 'Malicious') {
+            takedownBtn.style.display = 'inline-flex';
+            takedownBtn.style.alignItems = 'center';
+        } else {
+            takedownBtn.style.display = 'none';
+        }
+    }
 
     // Action badge
     const actionBadge = document.getElementById('modal-action-badge');
@@ -1065,6 +1141,7 @@ function renderTabs(isGlobal) {
             <button onclick="switchTab(0)" class="tab-button px-8 py-4 font-medium text-base border-b-2 border-transparent text-gray-400 hover:text-gray-300 transition-colors" data-target="0">Session Overview</button>
             <button onclick="switchTab(1)" class="tab-button px-8 py-4 font-medium text-base border-b-2 border-transparent text-gray-400 hover:text-gray-300 transition-colors" data-target="1">Detected Domains</button>
             <button onclick="switchTab(4)" class="tab-button px-8 py-4 font-medium text-base border-b-2 border-transparent text-gray-400 hover:text-gray-300 transition-colors" data-target="4">Session Logs</button>
+            <button onclick="switchTab(3)" class="tab-button px-8 py-4 font-medium text-base border-b-2 border-transparent text-gray-400 hover:text-gray-300 transition-colors" data-target="3">Session Reports</button>
         `;
     }
 
@@ -1105,7 +1182,8 @@ function downloadReport(type) {
     if (!currentSessionId) { showToast('⚠️ Select a session from the sidebar first'); return; }
     if (type === 'csv')  window.open(`/api/scans/${currentSessionId}/csv`, '_blank');
     else if (type === 'json') window.open(`/api/scans/${currentSessionId}/json`, '_blank');
-    else showToast('📄 Use CSV or JSON for now');
+    else if (type === 'pdf') window.open(`/api/scans/${currentSessionId}/pdf`, '_blank');
+    else showToast('📄 Export type not supported yet');
 }
 
 function exportAll() {
@@ -1137,6 +1215,8 @@ async function openAlertModal() {
 
         document.getElementById('alert-email-input').value = data.alert_email || '';
         document.getElementById('alert-malicious-only-toggle').checked = !!data.alert_malicious_only;
+        document.getElementById('alert-on-find-toggle').checked     = data.alert_on_find     !== false;
+        document.getElementById('alert-on-complete-toggle').checked  = data.alert_on_complete !== false;
 
         // SMTP status banner
         const banner = document.getElementById('smtp-status-banner');
@@ -1166,7 +1246,14 @@ function closeAlertModal() {
 async function saveAlertSettings() {
     const btn = document.getElementById('alert-save-btn');
     const email = document.getElementById('alert-email-input').value.trim();
-    const maliciousOnly = document.getElementById('alert-malicious-only-toggle').checked;
+    const maliciousOnly  = document.getElementById('alert-malicious-only-toggle').checked;
+    const alertOnFind    = document.getElementById('alert-on-find-toggle').checked;
+    const alertOnComplete = document.getElementById('alert-on-complete-toggle').checked;
+
+    if (!alertOnFind && !alertOnComplete) {
+        showToast('⚠️ Enable at least one alert mode', 'warn');
+        return;
+    }
 
     btn.disabled = true;
     btn.innerHTML = '<i class="fas fa-spinner fa-spin text-xs"></i> Saving…';
@@ -1175,7 +1262,12 @@ async function saveAlertSettings() {
         const res = await fetch('/api/alert-settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ alert_email: email, alert_malicious_only: maliciousOnly })
+            body: JSON.stringify({
+                alert_email:          email,
+                alert_malicious_only: maliciousOnly,
+                alert_on_find:        alertOnFind,
+                alert_on_complete:    alertOnComplete,
+            })
         });
         const data = await res.json();
         if (data.error) {
@@ -1248,6 +1340,169 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
+// ── Continuous Monitoring (Scheduled Scans) ───────────────────────────────────
+
+const INTERVAL_LABELS = { 1: 'Every Hour', 6: 'Every 6 Hours', 24: 'Daily', 168: 'Weekly' };
+
+async function loadScheduledScans() {
+    try {
+        const res = await fetch('/api/scheduled-scans');
+        if (!res.ok) return;
+        const schedules = await res.json();
+        renderSchedTable(schedules);
+    } catch (e) { console.error('Failed to load monitors:', e); }
+}
+
+function renderSchedTable(schedules) {
+    const tbody = document.getElementById('sched-table-body');
+    if (!tbody) return;
+    if (!schedules || schedules.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="px-6 py-10 text-center text-gray-600 text-xs italic">No monitors configured yet.</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = schedules.map(s => {
+        const intervalLabel = INTERVAL_LABELS[s.interval_hrs] || `${s.interval_hrs}h`;
+        const lastRun = s.last_run_at ? new Date(s.last_run_at + 'Z').toLocaleString() : '—';
+        const nextRun = s.next_run_at ? new Date(s.next_run_at + 'Z').toLocaleString() : '—';
+        const statusBadge = s.enabled
+            ? `<span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full bg-emerald-500/10 text-emerald-400 font-medium"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse inline-block"></span>Active</span>`
+            : `<span class="px-2 py-0.5 text-xs rounded-full bg-gray-700 text-gray-400 font-medium">Paused</span>`;
+        return `<tr class="hover:bg-gray-800/30 transition-colors">
+            <td class="px-6 py-4 font-mono font-semibold text-white">${esc(s.domain)}</td>
+            <td class="px-6 py-4 text-gray-400">${intervalLabel}</td>
+            <td class="px-6 py-4 text-gray-500 text-xs">${lastRun}</td>
+            <td class="px-6 py-4 text-gray-500 text-xs">${nextRun}</td>
+            <td class="px-6 py-4 text-center">${statusBadge}</td>
+            <td class="px-6 py-4 text-right">
+                <div class="flex justify-end gap-2">
+                    <button onclick="runSchedScanNow(${s.id}, this)" title="Scan immediately"
+                        class="text-xs px-3 py-1.5 rounded-lg border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 transition">
+                        <i class="fas fa-play mr-1"></i>Scan Now
+                    </button>
+                    <button onclick="toggleScheduledScan(${s.id}, ${!s.enabled})"
+                        class="text-xs px-3 py-1.5 rounded-lg border transition ${s.enabled ? 'border-amber-500/40 text-amber-400 hover:bg-amber-500/10' : 'border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10'}">
+                        ${s.enabled ? 'Pause' : 'Enable'}
+                    </button>
+                    <button onclick="deleteScheduledScan(${s.id})"
+                        class="text-xs px-3 py-1.5 rounded-lg border border-red-500/30 text-red-400 hover:bg-red-500/10 transition">
+                        Delete
+                    </button>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+async function addScheduledScan() {
+    const domainInput = document.getElementById('sched-domain-input');
+    const intervalSelect = document.getElementById('sched-interval-select');
+    const domain = domainInput.value.trim().toLowerCase();
+    const interval_hrs = parseInt(intervalSelect.value);
+
+    if (!domain) { showToast('❌ Please enter a domain to monitor'); return; }
+
+    const btn = document.getElementById('sched-add-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Adding...';
+
+    try {
+        const res = await fetch('/api/scheduled-scans', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domain, interval_hrs })
+        });
+        const data = await res.json();
+        if (data.error) { showToast('❌ ' + data.error); }
+        else {
+            showToast(`✅ Monitor added for ${domain}`);
+            domainInput.value = '';
+            loadScheduledScans();
+        }
+    } catch (e) {
+        showToast('❌ Network error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-plus"></i> Add Monitor';
+    }
+}
+
+async function toggleScheduledScan(id, enable) {
+    try {
+        await fetch(`/api/scheduled-scans/${id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: enable })
+        });
+        loadScheduledScans();
+    } catch (e) { showToast('❌ Failed to update monitor'); }
+}
+
+async function runSchedScanNow(id, btn) {
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>Starting…';
+    try {
+        const res = await fetch(`/api/scheduled-scans/${id}/run-now`, { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+            showToast(`🚀 ${data.message} — check the sidebar for the new scan session`);
+            // Refresh table after a moment so Last Run / Next Run updates
+            setTimeout(loadScheduledScans, 3000);
+        } else {
+            showToast('❌ ' + (data.error || 'Failed to start scan'));
+        }
+    } catch (e) {
+        showToast('❌ Network error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = original;
+    }
+}
+
+async function deleteScheduledScan(id) {
+    if (!confirm('Remove this monitoring schedule?')) return;
+    try {
+        await fetch(`/api/scheduled-scans/${id}`, { method: 'DELETE' });
+        showToast('🗑️ Monitor removed');
+        loadScheduledScans();
+    } catch (e) { showToast('❌ Failed to delete monitor'); }
+}
+
+async function submitTakedown() {
+
+    const domain = document.getElementById('modal-domain-name').textContent;
+    if (!domain || !currentSessionId) return;
+
+    const btn = document.getElementById('modal-takedown-btn');
+    const originalText = btn.innerHTML;
+
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Sending...';
+
+    try {
+        const res = await fetch(`/api/scans/${currentSessionId}/domains/${encodeURIComponent(domain)}/notify-brand`, {
+            method: 'POST'
+        });
+        const data = await res.json();
+
+        if (data.error) {
+            showToast('❌ Notification failed: ' + data.error);
+            btn.disabled = false;
+            btn.innerHTML = originalText;
+        } else {
+            showToast('✅ ' + data.message);
+            // Lock in success state to prevent double-send
+            btn.className = 'text-emerald-400 text-[11px] font-bold px-3 py-1.5 rounded-lg transition-all whitespace-nowrap border border-emerald-500/50 bg-emerald-600/20 cursor-not-allowed';
+            btn.innerHTML = '<i class="fas fa-check-circle mr-1"></i>Alert Sent!';
+        }
+    } catch (e) {
+        console.error(e);
+        showToast('❌ Network error sending notification');
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+    }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 window.onload = function () {
     if (typeof tailwind !== 'undefined') tailwind.config = { darkMode: 'class' };
@@ -1258,6 +1513,7 @@ window.onload = function () {
     initSocket();
     fetchSessions();
     loadGlobalDashboard();
+    loadScheduledScans();
 
     // Load bell dot state on page load
     fetch('/api/alert-settings').then(r => r.json()).then(data => {
