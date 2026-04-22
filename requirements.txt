@@ -1,16 +1,24 @@
 flask==3.0.3
 flask-socketio==5.4.1
 flask-sqlalchemy==3.1.1
+flask-login==0.6.3
 python-dotenv==1.0.1
+
+# Scanning & enrichment
 dnstwist==20250130
 beautifulsoup4==4.12.3
 requests==2.32.3
 Levenshtein==0.26.1
 python-whois==0.9.6
-flask-login==0.6.3
+
 # ML dependencies
 xgboost>=2.0.0
 scikit-learn>=1.4.0
 pandas>=2.0.0
-ucimlrepo>=0.0.6fpdf2==2.8.4
+ucimlrepo>=0.0.6
+
+# Reports
+fpdf2==2.8.4
+
+# Background scheduling
 apscheduler==3.10.4
