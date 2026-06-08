@@ -1372,5 +1372,7 @@ if __name__ == '__main__':
         ScanState=ScanState,
     )
     atexit.register(shutdown_scheduler)
-    print("🚀 PhishGuard started → http://127.0.0.1:8000")
-    socketio.run(app, host='127.0.0.1', port=8000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
+    port = int(os.environ.get('PORT', 8000))
+    host = '0.0.0.0'
+    print(f"🚀 PhishGuard started → http://{host}:{port}")
+    socketio.run(app, host=host, port=port, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)

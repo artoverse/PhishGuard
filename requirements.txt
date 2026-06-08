@@ -15,7 +15,6 @@ python-whois==0.9.6
 xgboost>=2.0.0
 scikit-learn>=1.4.0
 pandas>=2.0.0
-ucimlrepo>=0.0.6
 
 # Reports
 fpdf2==2.8.4
