@@ -22,7 +22,8 @@ from datetime import datetime, timedelta
 
 from enricher import enrich_domain
 from risk_analyzer import analyze_risk, get_sld
-from Levenshtein import distance as lev_distance
+from rapidfuzz.distance import Levenshtein as _lev
+lev_distance = _lev.distance
 from models import db, ScanSession, DetectedDomain, Alert, ScheduledScan
 from mailer import send_threat_alert, send_test_email as mailer_send_test
 

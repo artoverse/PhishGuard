@@ -8,7 +8,7 @@ python-dotenv==1.0.1
 dnstwist==20250130
 beautifulsoup4==4.12.3
 requests==2.32.3
-Levenshtein==0.26.1
+rapidfuzz>=3.0.0
 python-whois==0.9.6
 
 # ML dependencies

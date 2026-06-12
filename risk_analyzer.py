@@ -29,7 +29,8 @@ Scoring layout (max 100 pts):
 
 import math
 import os
-from Levenshtein import distance as lev_distance
+from rapidfuzz.distance import Levenshtein as _lev
+lev_distance = _lev.distance
 
 try:
     from ml_scorer import ml_score, is_model_available
