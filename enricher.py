@@ -4,15 +4,53 @@ import whois
 import ssl
 import socket
 import time
+import threading
 from datetime import datetime, timezone
 from flask import current_app
 
 
-# ─── WHOIS ─────────────────────────────────────────────────────────────────────
+# ─── Thread-based timeout helper ────────────────────────────────────────────────────────
+
+def _run_with_timeout(fn, args=(), timeout=8):
+    """
+    Run fn(*args) in a daemon thread.  Returns (result, None) on success
+    or (None, exception) on failure / timeout.
+    Works on any platform (no SIGALRM needed).
+    """
+    result    = [None]
+    exception = [None]
+
+    def _target():
+        try:
+            result[0] = fn(*args)
+        except Exception as e:
+            exception[0] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        # Thread is still running — WHOIS port likely blocked
+        return None, TimeoutError(f'WHOIS timed out after {timeout}s (port 43 may be blocked)')
+    return result[0], exception[0]
+
+
+# ─── WHOIS ───────────────────────────────────────────────────────────────────
 
 def get_whois_info(domain):
+    """
+    WHOIS lookup with an 8-second hard timeout.
+    On Render (and many cloud hosts) outbound port 43 is blocked or very slow.
+    The timeout prevents enrichment from stalling on every domain.
+    """
+    def _do_whois():
+        return whois.whois(domain)
+
+    w, err = _run_with_timeout(_do_whois, timeout=8)
+    if err or w is None:
+        return {'error': f'WHOIS failed: {err}'}
+
     try:
-        w = whois.whois(domain)
         creation = w.creation_date
         if isinstance(creation, list):
             creation = creation[0]
@@ -72,9 +110,7 @@ def get_whois_info(domain):
             'emails':               emails,
         }
     except Exception as e:
-        return {'error': f'WHOIS failed: {str(e)}'}
-
-
+        return {'error': f'WHOIS parse failed: {str(e)}'}
 
 
 # ─── Web Fetcher + Content Phishing Analysis ─────────────────────────────────

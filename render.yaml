@@ -9,8 +9,10 @@ services:
         value: 3.11.9
       - key: SECRET_KEY
         sync: false
-      - key: DATABASE_URL
-        value: sqlite:///phishguard.db
+      # VirusTotal API key — get a free key at https://virustotal.com
+      # Without this, VT enrichment is skipped and detection accuracy is reduced.
+      - key: VIRUSTOTAL_API_KEY
+        sync: false
       - key: MAIL_SERVER
         sync: false
       - key: MAIL_PORT

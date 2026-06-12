@@ -17,6 +17,7 @@ import io
 import json
 import traceback
 import time
+import requests as _requests
 from datetime import datetime, timedelta
 
 from enricher import enrich_domain
@@ -154,6 +155,68 @@ with app.app_context():
         db.session.rollback()
         print(f'⚠️  Could not migrate scrypt hashes: {_e}')
 
+# ─── DNS-over-HTTPS resolver (replaces raw UDP DNS blocked on Render) ──────────
+
+_DOH_URL  = 'https://cloudflare-dns.com/dns-query'
+_DOH_HDR  = {'accept': 'application/dns-json'}
+_DOH_SESS = None   # module-level session reused across threads
+_DOH_LOCK = threading.Lock()
+
+def _get_doh_session():
+    global _DOH_SESS
+    with _DOH_LOCK:
+        if _DOH_SESS is None:
+            _DOH_SESS = _requests.Session()
+            _DOH_SESS.headers.update(_DOH_HDR)
+        return _DOH_SESS
+
+
+def _doh_has_records(domain: str, timeout: float = 6.0) -> bool:
+    """
+    Returns True if `domain` has at least one A or AAAA record, using
+    Cloudflare DNS-over-HTTPS.  Falls back to False on any error.
+    This replaces dnstwist.Scanner UDP queries which are blocked on Render.
+    """
+    sess = _get_doh_session()
+    for qtype in ('A', 'AAAA'):
+        try:
+            resp = sess.get(
+                _DOH_URL,
+                params={'name': domain, 'type': qtype},
+                timeout=timeout
+            )
+            if resp.ok:
+                data = resp.json()
+                # Status 0 = NOERROR, and at least one Answer record present
+                if data.get('Status') == 0 and data.get('Answer'):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _doh_resolve_worker(work_queue: queue_module.Queue,
+                        stop_event: threading.Event,
+                        resolved_set: set,
+                        lock: threading.Lock) -> None:
+    """Worker thread: pop permutations from queue, check via DoH, mark registered."""
+    while not stop_event.is_set():
+        try:
+            perm = work_queue.get(timeout=0.5)
+        except queue_module.Empty:
+            break
+        try:
+            domain_name = str(perm.get('domain', ''))
+            if domain_name and _doh_has_records(domain_name):
+                with lock:
+                    resolved_set.add(id(perm))
+                    perm['dns-a'] = ['resolved']   # mark so is_registered() → True
+        except Exception:
+            pass
+        finally:
+            work_queue.task_done()
+
+
 # ─── Per-session Scan State ───────────────────────────────────────────────────
 
 class ScanState:
@@ -165,7 +228,7 @@ class ScanState:
         self.all_domains = []                 # all Permutation objects (fuzzer.domains)
         self.pending_dns = []                 # Permutations NOT yet DNS-resolved
         self.pending_enrich = []              # Permutations resolved, not yet enriched
-        self.scanners = []                    # active dnstwist.Scanner threads
+        self.scanners = []                    # active dnstwist.Scanner threads (unused on Render)
         self.work_queue = None
         self.dns_total   = 0                  # total DNS permutations to resolve
         self.dns_done    = 0                  # how many have been resolved so far
@@ -208,60 +271,67 @@ def _do_scan(session_id: str, domain: str,
             pass
 
         try:
-            # ── Phase 1: DNS Resolution ───────────────────────────────────────
+            # ── Phase 1: DNS Resolution (via DoH — works on Render/restricted hosts) ─
             if pending_enrich is None:
                 # Decide what to resolve: either a partial list (resume) or all
                 to_resolve = pending_dns if pending_dns is not None else state.all_domains
+                # Strip the *original marker entry — it's never a phishing domain
+                candidates = [p for p in to_resolve if p.get('fuzzer') != '*original']
                 state.phase = 'dns'
-                
+
                 if pending_dns is not None:
-                    emit_scan_log(session_id, f"Resuming Phase 1: DNS Resolution ({len(to_resolve)} permutations remaining)...", 'info')
+                    emit_scan_log(session_id, f"Resuming Phase 1: DoH Resolution ({len(candidates)} permutations remaining)...", 'info')
                 else:
-                    emit_scan_log(session_id, f"Phase 1: DNS Resolution started. {len(to_resolve)} total permutations to check.", 'info')
+                    emit_scan_log(session_id, f"Phase 1: DoH Resolution started. {len(candidates)} permutations to check via DNS-over-HTTPS.", 'info')
 
                 work_queue = queue_module.Queue()
-                for p in to_resolve:
+                for p in candidates:
                     work_queue.put(p)
                 state.work_queue = work_queue
 
-                # DNS resolution is pure I/O — more threads = faster completion.
-                # dnstwist itself defaults to cpu_count+4; we scale with domain count
-                # so small scans stay lean while large ones (600 perms) finish fast.
-                n_threads = min(200, max(1, len(to_resolve)))
-                emit_scan_log(session_id, f"Booting {n_threads} concurrent DNS resolver threads for {len(to_resolve)} permutations.", 'info')
+                # Use 50 concurrent DoH threads — each query is an HTTPS call
+                # (more threads = faster, but Cloudflare DoH rate-limits at ~1k req/s)
+                n_threads = min(50, max(1, len(candidates)))
+                emit_scan_log(session_id,
+                    f"Booting {n_threads} concurrent DoH resolver threads for {len(candidates)} permutations.",
+                    'info')
 
-                scanners = [dnstwist.Scanner(work_queue) for _ in range(n_threads)]
-                state.scanners = scanners
-                state.dns_total = len(to_resolve)   # store for progress bar
+                resolved_ids: set = set()
+                resolved_lock = threading.Lock()
+
+                workers = [
+                    threading.Thread(
+                        target=_doh_resolve_worker,
+                        args=(work_queue, state.stop_event, resolved_ids, resolved_lock),
+                        daemon=True
+                    )
+                    for _ in range(n_threads)
+                ]
+                state.dns_total = len(candidates)
                 state.dns_done  = 0
-                for s in scanners:
-                    s.start()
+                for w in workers:
+                    w.start()
 
-                print(f"📡 [{session_id[:8]}] DNS resolving {len(to_resolve)} permutations "
+                print(f"📡 [{session_id[:8]}] DoH resolving {len(candidates)} permutations "
                       f"({'resume' if pending_dns is not None else 'fresh'})...")
 
                 # Poll until queue drained OR stop requested
                 last_logged_pct = -1
                 while work_queue.unfinished_tasks > 0:
-                    # Update dns_done from queue progress
                     state.dns_done = state.dns_total - work_queue.unfinished_tasks
 
-                    # Emit a progress log every 10% so the UI shows movement
                     if state.dns_total > 0:
                         pct = int((state.dns_done / state.dns_total) * 100)
                         rounded = (pct // 10) * 10
                         if rounded > last_logged_pct and rounded > 0:
                             last_logged_pct = rounded
                             emit_scan_log(session_id,
-                                f"DNS progress: {state.dns_done}/{state.dns_total} ({rounded}%) resolved...",
+                                f"DoH progress: {state.dns_done}/{state.dns_total} ({rounded}%) checked...",
                                 'info')
+
                     if state.stop_event.is_set():
                         # ── PAUSE during DNS phase ───────────────────────────
-                        for s in scanners:
-                            s.stop()
-                        time.sleep(0.6)   # let in-flight items finish
-
-                        # Drain items still in queue → these were NOT resolved
+                        # Drain remaining queue items back to pending_dns
                         remaining_dns = []
                         while True:
                             try:
@@ -271,12 +341,9 @@ def _do_scan(session_id: str, domain: str,
                             except queue_module.Empty:
                                 break
 
-                        # Items not remaining = were processed (resolved or NXDOMAIN)
-                        remaining_ids = {id(p) for p in remaining_dns}
                         resolved_so_far = [
-                            p for p in to_resolve
-                            if id(p) not in remaining_ids
-                            and p.is_registered()
+                            p for p in candidates
+                            if id(p) in resolved_ids
                             and p.get('fuzzer') != '*original'
                         ]
 
@@ -284,25 +351,26 @@ def _do_scan(session_id: str, domain: str,
                         state.pending_enrich = resolved_so_far
 
                         _set_db_status(session_id, 'paused', enriched_count)
-                        msg = f"Paused during DNS — {len(remaining_dns)} unresolved, {len(resolved_so_far)} queued for enrichment"
+                        msg = f"Paused during DoH DNS — {len(remaining_dns)} unresolved, {len(resolved_so_far)} queued for enrichment"
                         print(f"⏸  [{session_id[:8]}] " + msg)
-                        emit_scan_log(session_id, "DNS resolution engine suspended safely.", 'warning')
+                        emit_scan_log(session_id, "DoH resolution suspended safely.", 'warning')
                         emit_scan_log(session_id, msg, 'info')
                         return
 
-                    time.sleep(0.1)   # tighter poll → faster completion detection
+                    time.sleep(0.2)
 
-                for s in scanners:
-                    s.stop()
+                # Wait for all worker threads to finish cleanly
+                for w in workers:
+                    w.join(timeout=2)
 
                 # All DNS done — collect registered lookalikes
                 registered = [
-                    p for p in to_resolve
-                    if p.is_registered() and p.get('fuzzer') != '*original'
+                    p for p in candidates
+                    if id(p) in resolved_ids and p.get('fuzzer') != '*original'
                 ]
                 state.pending_enrich = registered
                 state.pending_dns = []
-                msg = f"DNS Phase Complete — {len(registered)} registered lookalikes successfully isolated."
+                msg = f"DoH Phase Complete — {len(registered)} registered lookalikes found out of {len(candidates)} checked."
                 print(f"✅ [{session_id[:8]}] " + msg)
                 emit_scan_log(session_id, msg, 'success')
             else:
