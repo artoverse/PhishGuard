@@ -11,9 +11,9 @@ requests==2.32.3
 rapidfuzz>=3.0.0
 python-whois==0.9.6
 
-# ML dependencies
-xgboost>=2.0.0
-scikit-learn>=1.4.0
+# ML dependencies — pinned to versions with pre-built manylinux wheels (Render)
+numpy>=1.26.0,<2.0.0
+scikit-learn==1.5.2
 pandas>=2.0.0
 
 # Reports

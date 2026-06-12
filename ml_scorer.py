@@ -54,13 +54,21 @@ def load_model(path=None):
     p = path or _MODEL_PATH
     if not os.path.exists(p):
         return None, None
-    with open(p, 'rb') as f:
-        payload = pickle.load(f)
-    model         = payload['model']
-    feature_names = payload['features']
-    _MODEL_CACHE  = (model, feature_names)
-    print(f"✅ [ml_scorer] Model loaded from {p} ({len(feature_names)} features)")
-    return _MODEL_CACHE
+    try:
+        with open(p, 'rb') as f:
+            payload = pickle.load(f)
+        model         = payload['model']
+        feature_names = payload['features']
+        _MODEL_CACHE  = (model, feature_names)
+        print(f"✅ [ml_scorer] Model loaded from {p} ({len(feature_names)} features)")
+        return _MODEL_CACHE
+    except (ImportError, ModuleNotFoundError) as e:
+        # sklearn C extensions (e.g. _loss) missing on this host — fall back to rule scorer
+        print(f"⚠️  [ml_scorer] sklearn C extension unavailable ({e}). ML scoring disabled, using rule scorer only.")
+        return None, None
+    except Exception as e:
+        print(f"⚠️  [ml_scorer] Failed to load model: {e}")
+        return None, None
 
 
 def is_model_available():
