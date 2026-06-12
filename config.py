@@ -31,9 +31,10 @@ class Config:
     VT_API_KEY = os.environ.get('VIRUSTOTAL_API_KEY', '')
 
     # Optional: email alerts (add SMTP details to .env later)
-    MAIL_SERVER = os.environ.get('MAIL_SERVER')
-    MAIL_PORT = int(os.environ.get('MAIL_PORT', 587))
+    # Strip any accidental quotes that might be copy-pasted into the Render dashboard
+    MAIL_SERVER = (os.environ.get('MAIL_SERVER') or '').strip(' "\'') or None
+    MAIL_PORT = int((os.environ.get('MAIL_PORT') or '587').strip(' "\'') or 587)
     MAIL_USE_TLS = True
-    MAIL_USERNAME = os.environ.get('MAIL_USERNAME')
-    MAIL_PASSWORD = os.environ.get('MAIL_PASSWORD')
-    ALERT_FROM_EMAIL = os.environ.get('ALERT_FROM_EMAIL')
+    MAIL_USERNAME = (os.environ.get('MAIL_USERNAME') or '').strip(' "\'') or None
+    MAIL_PASSWORD = (os.environ.get('MAIL_PASSWORD') or '').strip(' "\'') or None
+    ALERT_FROM_EMAIL = (os.environ.get('ALERT_FROM_EMAIL') or '').strip(' "\'') or None
